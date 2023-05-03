@@ -1,0 +1,26 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Llama-S Relora",
+            "type": "python",
+            "request": "launch",
+            "program": "main.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": [
+                "--model_config", "peft_pretraining/llama_small.json",
+                "--use_peft",
+                "--relora", "100",
+                "--train_ln",
+                "--device", "cuda:0",
+                "--lr", "0.0005",
+                "--batch_size", "48",
+                "--dtype", "bfloat16"
+            ]
+        }
+    ]
+}
