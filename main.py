@@ -3,8 +3,7 @@ import argparse
 import torch
 
 import transformers
-from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM, LlamaModel
-from peft import get_peft_model, TaskType
+from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
 
 import datasets
 import wandb
@@ -12,7 +11,6 @@ import wandb
 from tqdm import tqdm
 from loguru import logger
 
-from peft_pretraining.gpt2 import GPT2LMHeadModel
 from peft_pretraining.relora import ReLoRaModel
 
 
