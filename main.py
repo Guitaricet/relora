@@ -142,11 +142,6 @@ def main(args):
     logger.info(f"Total params after  LoRA: {params_after / 1_000_000:.2f}M")
     logger.info(f"Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1_000_000:.2f}M")
 
-    # print all trainable modules
-    for name, module in model.named_modules():
-        if hasattr(module, "weight") and module.weight.requires_grad:
-            logger.info(f"{name:40} {module.weight.shape}")
-
     model = model.to(device, dtype=getattr(torch, args.dtype))
 
     n_total_params = sum(p.numel() for p in model.parameters())
