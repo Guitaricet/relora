@@ -33,7 +33,7 @@ def parse_args(args):
 
     parser.add_argument("--num_training_steps", type=int, default=10_000)
     parser.add_argument("--device", type=str, default=None)
-    parser.add_argument("--dtype", type=str, default="float32")
+    parser.add_argument("--dtype", type=str, default="bfloat16")
 
     args = parser.parse_args(args)
     return args
