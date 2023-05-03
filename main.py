@@ -97,12 +97,15 @@ def main(args):
     if args.num_layers is not None:
         model_config.n_layer = args.num_layers
 
-    # model = GPT2LMHeadModel.from_config(model_config)
     model = AutoModelForCausalLM.from_config(model_config)
 
-    params_before = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    params_before = sum(p.numel() for p in model.parameters())
+    trainable_before = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     if args.use_peft:
+        for p in model.parameters():
+            p.requires_grad = False
+
         model = ReLoRaModel(
             model,
             r=args.lora_r,
@@ -116,31 +119,32 @@ def main(args):
             # model.norm, model.layers.input_layernorm, model.layers.post_attention_layernorm
             if args.train_ln and "norm" in name:
                 param.requires_grad = True        
-            if "lm_head" in name:
+            elif "lm_head" in name:
                 param.requires_grad = True
-            if "embed_tokens" in name:
+            elif "embed_tokens" in name:
                 param.requires_grad = True
-            # LLaMa uses rotary embeddings and they are not trainable
-
-            # GPT2
-            # if args.train_ln and "ln_" in name:
-            #     param.requires_grad = True
-            # if "lm_head" in name:
-            #     param.requires_grad = True
-            # if "wte" in name:
-            #     param.requires_grad = True
-            # if "wpe" in name:
-            #     param.requires_grad = True
+            elif "bias" in name:
+                param.requires_grad = True
+            elif "lora_" in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
 
     params_after = sum(p.numel() for p in model.parameters())
-    if args.use_peft:
-        assert params_after > params_before
+    trainable_after = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     # print params and trainable params
     print(model)
     logger.info(f"Total params before LoRA: {params_before / 1_000_000:.2f}M")
     logger.info(f"Total params after  LoRA: {params_after / 1_000_000:.2f}M")
     logger.info(f"Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1_000_000:.2f}M")
+
+    if args.use_peft:
+        if (params_after <= params_before):
+            raise ValueError("Total number of parameters should increase after applying LoRA")
+        
+        if (trainable_after >= trainable_before):
+            raise ValueError("Total number of trainable parameters should decrease after applying LoRA")
 
     model = model.to(device, dtype=getattr(torch, args.dtype))
 
