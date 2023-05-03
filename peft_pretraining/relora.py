@@ -56,7 +56,7 @@ class ReLoRaModel(torch.nn.Module):
         return parent
 
     def merge_and_reinit(self):
-        for module in self.model.modules():
+        for module in self.modules():
             if isinstance(module, ReLoRaLinear):
                 module.merge_and_reinit()
 

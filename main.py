@@ -47,7 +47,12 @@ def main(args):
         logger.info(f"{k:20} {v}")
     logger.info("*" * 40)
 
-    data = datasets.load_dataset("c4", "en", split="train", streaming=True)
+    dataset_name = "c4"  # switch to "togethercomputer/RedPajama-Data-1T" later
+    if dataset_name == "c4":
+        data = datasets.load_dataset("c4", "en", split="train", streaming=True)
+    else:
+        data = datasets.load_dataset(dataset_name, split="train", streaming=True)
+
     data = data.shuffle(seed=42)
 
     # it doesn't matter which tokenizer we use, because we train from scratch
@@ -160,24 +165,23 @@ def main(args):
         optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=args.num_training_steps,
     )
 
-    _config = {
-        "using_peft": args.use_peft,
-        "layer_norm_trainable": args.train_ln,
+    # from args
+    _config = vars(args)
+    _config["max_lr"] = _config.pop("lr")  # rename lr to max_lr
+    _config_ext = {
         "total_params": n_total_params,
         "trainable_params": n_trainable_params,
         "percent_trainable_params": p_trainable_params,
         "name_trainable_params": trainable_params_names,
         "dataset": "c4",
-        "batch_size": args.batch_size,
-        "max_lr": args.lr,
-        "warmup_steps": args.warmup_steps,
-        "max_length": args.max_length,
         "model": model_config.to_dict(),
         "scheduler": "linear",
         "device": str(device),
     }
+    _config.update(_config_ext)
+
     if args.use_peft:
-        logger.warning("PEFT config is hardcoded!")
+        logger.warning("PEFT config (all but lora_r) is hardcoded!")
         _config["peft_config"] = {
             "r": args.lora_r,
             "alpha": 32,
