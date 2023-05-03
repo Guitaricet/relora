@@ -17,11 +17,10 @@ from peft_pretraining.relora import ReLoRaModel
 def parse_args(args):
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--model_config", type=str, default="peft_pretraining/llama_small.json")
-    parser.add_argument("--num_layers", type=int, default=None)
+    parser.add_argument("--model_config", type=str, required=True)
 
-    parser.add_argument("--batch_size", type=int, default=24)
-    parser.add_argument("--max_length", type=int, default=128)
+    parser.add_argument("--batch_size", type=int, required=True)
+    parser.add_argument("--max_length", type=int, default=512)
 
     parser.add_argument("--use_peft", action="store_true")
     parser.add_argument("--lora_r", type=int, default=128)
@@ -29,6 +28,7 @@ def parse_args(args):
 
     parser.add_argument("--train_ln", action="store_true")
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--gradient_accumulation", type=int, default=1)
     parser.add_argument("--warmup_steps", type=int, default=1_000)
 
     parser.add_argument("--num_training_steps", type=int, default=10_000)
@@ -99,9 +99,6 @@ def main(args):
 
     model_config = AutoConfig.from_pretrained(args.model_config)
 
-    if args.num_layers is not None:
-        model_config.n_layer = args.num_layers
-
     model = AutoModelForCausalLM.from_config(model_config)
 
     params_before = sum(p.numel() for p in model.parameters())
@@ -170,10 +167,12 @@ def main(args):
     _config["max_lr"] = _config.pop("lr")  # rename lr to max_lr
     _config_ext = {
         "total_params": n_total_params,
+        "total_params_M": n_total_params / 1_000_000,
         "trainable_params": n_trainable_params,
+        "trainable_params_M": n_trainable_params / 1_000_000,
         "percent_trainable_params": p_trainable_params,
         "name_trainable_params": trainable_params_names,
-        "dataset": "c4",
+        "dataset": dataset_name,
         "model": model_config.to_dict(),
         "scheduler": "linear",
         "device": str(device),
@@ -193,12 +192,14 @@ def main(args):
     pbar = tqdm(total=args.num_training_steps)
 
     global_step = 0
+    update_step = 0
     for epoch in range(1):  # we'll probably never go through all the data
         data_mapped.set_epoch(epoch)
         for batch in data_mapped.batch(batch_size=args.batch_size):
             global_step += 1
             pbar.update(1)
-            if global_step > args.num_training_steps:
+            if global_step > args.num_training_steps * args.gradient_accumulation:
+                logger.info(f"Reached max number of update steps (f{args.num_training_steps}). Stopping training.")
                 break
 
             optimizer.zero_grad()
@@ -207,19 +208,28 @@ def main(args):
             labels = batch["input_ids"].clone()
             labels[labels == 0] = -100
 
-            loss = model(**batch, labels=labels).loss
+            loss = model(**batch, labels=labels).loss / args.gradient_accumulation
             loss.backward()
+
+            if global_step % args.gradient_accumulation != 0:
+                continue
+
+            update_step += 1
             optimizer.step()
             scheduler.step()
 
-            if args.relora and global_step % args.relora == 0:
+            if args.relora and update_step % args.relora == 0:
                 print("In merge and reinit")
                 model.merge_and_reinit()
 
             lr = scheduler.get_last_lr()[0]
+            tokens_seen = global_step * args.max_length * args.batch_size
+
             wandb.log({
                 "loss": loss.item(),
                 "lr": lr,
+                "update_step": update_step,
+                "tokens_seen": tokens_seen,
                 },
                 step=global_step,
             )
