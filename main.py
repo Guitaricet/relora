@@ -3,7 +3,7 @@ import argparse
 import torch
 
 import transformers
-from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM, LlamaModel
 
 import datasets
 import wandb
@@ -20,7 +20,7 @@ def parse_args(args):
     parser.add_argument("--model_config", type=str, required=True)
 
     parser.add_argument("--batch_size", type=int, required=True)
-    parser.add_argument("--max_length", type=int, default=512)
+    parser.add_argument("--max_length", type=int, default=256)
 
     parser.add_argument("--use_peft", action="store_true")
     parser.add_argument("--lora_r", type=int, default=128)
@@ -29,6 +29,7 @@ def parse_args(args):
     parser.add_argument("--train_ln", action="store_true")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--gradient_accumulation", type=int, default=1)
+    parser.add_argument("--activation_checkpointing", action="store_true")
     parser.add_argument("--warmup_steps", type=int, default=1_000)
 
     parser.add_argument("--num_training_steps", type=int, default=10_000)
@@ -44,7 +45,7 @@ def main(args):
     logger.info(f"Starting training with the arguments")
     # use f-string formatting to align the arguments
     for k, v in vars(args).items():
-        logger.info(f"{k:20} {v}")
+        logger.info(f"{k:30} {v}")
     logger.info("*" * 40)
 
     dataset_name = "c4"  # switch to "togethercomputer/RedPajama-Data-1T" later
@@ -100,6 +101,8 @@ def main(args):
     model_config = AutoConfig.from_pretrained(args.model_config)
 
     model = AutoModelForCausalLM.from_config(model_config)
+    if args.activation_checkpointing:
+        model.gradient_checkpointing_enable()
 
     params_before = sum(p.numel() for p in model.parameters())
     trainable_before = sum(p.numel() for p in model.parameters() if p.requires_grad)
