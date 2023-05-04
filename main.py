@@ -1,10 +1,11 @@
+import os
 import argparse
 from datetime import datetime
 
 import torch
 
 import transformers
-from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM, LlamaModel
+from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM, LlamaForCausalLM
 
 import datasets
 import wandb
@@ -53,7 +54,6 @@ def parse_args(args):
 def main(args):
     logger.info("*" * 40)
     logger.info(f"Starting training with the arguments")
-    # use f-string formatting to align the arguments
     for k, v in vars(args).items():
         logger.info(f"{k:30} {v}")
     logger.info("*" * 40)
@@ -107,10 +107,8 @@ def main(args):
     data_mapped.batch = lambda batch_size: batch_fn(data_mapped, batch_size)
 
     device = args.device or "cuda"
-
     model_config = AutoConfig.from_pretrained(args.model_config)
-
-    model = AutoModelForCausalLM.from_config(model_config)
+    model: LlamaForCausalLM = AutoModelForCausalLM.from_config(model_config)
     if args.activation_checkpointing:
         model.gradient_checkpointing_enable()
 
@@ -149,7 +147,7 @@ def main(args):
     trainable_after = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     # print params and trainable params
-    print(model)
+    logger.info(f"\n{model}\n")
     logger.info(f"Total params before LoRA: {params_before / 1_000_000:.2f}M")
     logger.info(f"Total params after  LoRA: {params_after / 1_000_000:.2f}M")
     logger.info(f"Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1_000_000:.2f}M")
@@ -179,9 +177,10 @@ def main(args):
     )
 
     # from args
-    _config = vars(args)
+    _config = dict(vars(args))
     _config["max_lr"] = _config.pop("lr")  # rename lr to max_lr
     _config_ext = {
+        "total_batch_size": args.batch_size * args.gradient_accumulation,
         "total_params": n_total_params,
         "total_params_M": n_total_params / 1_000_000,
         "trainable_params": n_trainable_params,
@@ -205,66 +204,68 @@ def main(args):
         }
 
     wandb.init(project="peft_pretraining", config=_config)
-    pbar = tqdm(total=args.num_training_steps)
+    pbar = tqdm(total=args.num_training_steps * args.gradient_accumulation)
 
     global_step = 0
     update_step = 0
-    for epoch in range(1):  # we'll probably never go through all the data
-        data_mapped.set_epoch(epoch)
-        for batch in data_mapped.batch(batch_size=args.batch_size):
-            global_step += 1
-            pbar.update(1)
-            if global_step > args.num_training_steps * args.gradient_accumulation:
-                logger.info(f"Reached max number of update steps (f{args.num_training_steps}). Stopping training.")
-                break
+    tokens_seen = 0
+    pad_idx = tokenizer.pad_token_id
 
-            optimizer.zero_grad()
+    # we'll never go through all the data, so no need for epochs
+    for batch in data_mapped.batch(batch_size=args.batch_size):
+        global_step += 1
+        pbar.update(1)
+        if global_step > args.num_training_steps * args.gradient_accumulation:
+            logger.info(f"Reached max number of update steps (f{args.num_training_steps}). Stopping training.")
+            break
 
-            batch = {k: v.to(device) for k, v in batch.items()}
-            labels = batch["input_ids"].clone()
-            labels[labels == 0] = -100
+        batch = {k: v.to(device) for k, v in batch.items()}
+        labels = batch["input_ids"].clone()
+        labels[labels == pad_idx] = -100
+        tokens_seen += (batch["input_ids"] != pad_idx).sum().item()
 
-            loss = model(**batch, labels=labels).loss / args.gradient_accumulation
-            loss.backward()
+        loss = model(**batch, labels=labels).loss / args.gradient_accumulation
+        loss.backward()
 
-            if global_step % args.gradient_accumulation != 0:
-                continue
+        if global_step % args.gradient_accumulation != 0:
+            continue
 
-            update_step += 1
-            optimizer.step()
-            scheduler.step()
+        # The below code is only executed during the update step
+        update_step += 1
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad()
 
-            if update_step % args.save_every == 0:
-                logger.info(f"Saving model at update step {update_step}")
-                current_model_directory = f"{args.save_dir}/model_{update_step}"
-                model.save_pretrained(current_model_directory)
-                optimizer_checkpoint = {
-                    "optimizer": optimizer.state_dict(),
-                    "scheduler": scheduler.state_dict(),
-                    "update_step": update_step,
-                    "global_step": global_step,
-                    "epoch": epoch,
-                    "config": _config,
-                    "wandb": wandb.run.dir,
-                    "dtype": args.dtype,
-                }
-                torch.save(optimizer_checkpoint, f"{current_model_directory}/optimizer.pt")
-
-            if args.relora and update_step % args.relora == 0:
-                print("In merge and reinit")
-                model.merge_and_reinit()
-
-            lr = scheduler.get_last_lr()[0]
-            tokens_seen = global_step * args.max_length * args.batch_size
-
-            wandb.log({
-                "loss": loss.item(),
-                "lr": lr,
+        if update_step % args.save_every == 0:
+            logger.info(f"Saving model at update step {update_step}")
+            os.makedirs(args.save_dir, exist_ok=True)
+            current_model_directory = f"{args.save_dir}/model_{update_step}"
+            model.save_pretrained(current_model_directory)
+            optimizer_checkpoint = {
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
                 "update_step": update_step,
-                "tokens_seen": tokens_seen,
-                },
-                step=global_step,
-            )
+                "global_step": global_step,
+                "config": _config,
+                "wandb": wandb.run.dir,
+                "dtype": args.dtype,
+            }
+            torch.save(optimizer_checkpoint, f"{current_model_directory}/optimizer.pt")
+
+        if args.relora and update_step % args.relora == 0:
+            logger.info("In merge and reinit")
+            model.merge_and_reinit()
+
+        lr = scheduler.get_last_lr()[0]
+
+        wandb.log({
+            "loss": loss.item(),
+            "lr": lr,
+            "update_step": update_step,
+            "tokens_seen": tokens_seen,
+            },
+            step=global_step,
+        )
 
     pbar.close()
     logger.info("Training finished")
