@@ -1,8 +1,23 @@
+import os
 import math
+import json
+from typing import List
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from transformers import AutoModel, AutoConfig
+
+
+@dataclass
+class ReLoRaConfig:
+    r: int
+    lora_alpha: int
+    lora_dropout: float
+    target_modules: List[str]
+
 
 class ReLoRaModel(torch.nn.Module):
     def __init__(self, model, r, lora_alpha, lora_dropout, target_modules):
@@ -14,6 +29,12 @@ class ReLoRaModel(torch.nn.Module):
         self.r = r
         self.lora_alpha = lora_alpha
         self.lora_dropout = lora_dropout
+        self._config = ReLoRaConfig(
+            r=r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            target_modules=target_modules,
+        )
 
         # patch methods
         self.forward = self.wrapped_model.forward
@@ -59,6 +80,28 @@ class ReLoRaModel(torch.nn.Module):
         for module in self.modules():
             if isinstance(module, ReLoRaLinear):
                 module.merge_and_reinit()
+
+    def save_pretrained(self, path):
+        self.wrapped_model.save_pretrained(path)
+        with open(os.path.join(path, "relora_config.json"), "w") as f:
+            json.dump(self._config.__dict__, f, indent=4)
+    
+    @classmethod
+    def from_pretrained(cls, path):
+        # NOT TESTED
+        with open(os.path.join(path, "relora_config.json"), "r") as f:
+            relora_config = json.load(f)
+        with open(os.path.join(path, "config.json"), "r") as f:
+            config = json.load(f)
+
+        base_model = AutoModel.from_config(config)
+        model = cls(base_model, **relora_config)
+
+        with open(os.path.join(path, "pytorch_model.bin"), "rb") as f:
+            state_dict = torch.load(f, map_location="cpu")
+        
+        model.load_state_dict(state_dict, strict=True)
+        return model
 
 
 # The code is based on https://github.com/microsoft/LoRA/blob/main/loralib/layers.py

@@ -1,4 +1,5 @@
 import argparse
+from datetime import datetime
 
 import torch
 
@@ -32,11 +33,20 @@ def parse_args(args):
     parser.add_argument("--activation_checkpointing", action="store_true")
     parser.add_argument("--warmup_steps", type=int, default=1_000)
 
-    parser.add_argument("--num_training_steps", type=int, default=10_000)
+    parser.add_argument("--num_training_steps", type=int, default=10_000,
+                        help="Number of **update steps** to train for. "
+                             "Notice that gradient accumulation is taken into account.")
+    parser.add_argument("--save_every", type=int, default=10_000)
+    parser.add_argument("--save_dir", type=str, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--dtype", type=str, default="bfloat16")
 
     args = parser.parse_args(args)
+
+    if args.save_dir is None:
+        # use checkpoints / model name, date and time as save directory
+        args.save_dir = f"checkpoints/{args.model_config.split('/')[-1]}-{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}"
+
     return args
 
 
@@ -144,6 +154,9 @@ def main(args):
     logger.info(f"Total params after  LoRA: {params_after / 1_000_000:.2f}M")
     logger.info(f"Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1_000_000:.2f}M")
 
+    if args.save_dir:
+        logger.info(f"Saving model to {args.save_dir} every {args.save_every} update steps")
+
     if args.use_peft:
         if (params_after <= params_before):
             raise ValueError("Total number of parameters should increase after applying LoRA")
@@ -220,6 +233,22 @@ def main(args):
             update_step += 1
             optimizer.step()
             scheduler.step()
+
+            if update_step % args.save_every == 0:
+                logger.info(f"Saving model at update step {update_step}")
+                current_model_directory = f"{args.save_dir}/model_{update_step}"
+                model.save_pretrained(current_model_directory)
+                optimizer_checkpoint = {
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "update_step": update_step,
+                    "global_step": global_step,
+                    "epoch": epoch,
+                    "config": _config,
+                    "wandb": wandb.run.dir,
+                    "dtype": args.dtype,
+                }
+                torch.save(optimizer_checkpoint, f"{current_model_directory}/optimizer.pt")
 
             if args.relora and update_step % args.relora == 0:
                 print("In merge and reinit")
