@@ -1,4 +1,5 @@
 import os
+import time
 import argparse
 from datetime import datetime
 
@@ -27,8 +28,11 @@ def parse_args(args):
     parser.add_argument("--use_peft", action="store_true")
     parser.add_argument("--lora_r", type=int, default=128)
     parser.add_argument("--relora", type=int, default=None)
+    parser.add_argument("--force_keep_original", default=False, action="store_true",
+                        help=("Keep original model parameters even if relora is None. "
+                              "Useful for making sure that full-LoRa model is equivalent to model+LoRa."))
 
-    parser.add_argument("--train_ln", action="store_true")
+    parser.add_argument("--train_ln", default=True, action="store_true")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--gradient_accumulation", type=int, default=1)
     parser.add_argument("--activation_checkpointing", action="store_true")
@@ -43,6 +47,9 @@ def parse_args(args):
     parser.add_argument("--dtype", type=str, default="bfloat16")
 
     args = parser.parse_args(args)
+
+    if not args.train_ln:
+        raise ValueError("Are you sure? Not training LN is a bad idea.")
 
     if args.save_dir is None:
         # use checkpoints / model name, date and time as save directory
@@ -106,7 +113,9 @@ def main(args):
 
     data_mapped.batch = lambda batch_size: batch_fn(data_mapped, batch_size)
 
+    args.total_batch_size = args.batch_size * args.gradient_accumulation
     device = args.device or "cuda"
+
     model_config = AutoConfig.from_pretrained(args.model_config)
     model: LlamaForCausalLM = AutoModelForCausalLM.from_config(model_config)
     if args.activation_checkpointing:
@@ -125,6 +134,7 @@ def main(args):
             lora_alpha=32,
             lora_dropout=0.1,
             target_modules=["attn", "mlp"],
+            keep_original=args.relora is not None or args.force_keep_original,
         )
 
         for name, param in model.named_parameters():
@@ -155,12 +165,12 @@ def main(args):
     if args.save_dir:
         logger.info(f"Saving model to {args.save_dir} every {args.save_every} update steps")
 
-    if args.use_peft:
+    if args.use_peft and args.relora is not None:
         if (params_after <= params_before):
-            raise ValueError("Total number of parameters should increase after applying LoRA")
+            raise ValueError("Total number of parameters should increase after applying LoRA with restarts")
         
         if (trainable_after >= trainable_before):
-            raise ValueError("Total number of trainable parameters should decrease after applying LoRA")
+            raise ValueError("Total number of trainable parameters should decrease after applying LoRA with restarts")
 
     model = model.to(device, dtype=getattr(torch, args.dtype))
 
@@ -209,7 +219,9 @@ def main(args):
     global_step = 0
     update_step = 0
     tokens_seen = 0
+    tokens_seen_before = 0
     pad_idx = tokenizer.pad_token_id
+    update_time = time.time()
 
     # we'll never go through all the data, so no need for epochs
     for batch in data_mapped.batch(batch_size=args.batch_size):
@@ -224,17 +236,19 @@ def main(args):
         labels[labels == pad_idx] = -100
         tokens_seen += (batch["input_ids"] != pad_idx).sum().item()
 
-        loss = model(**batch, labels=labels).loss / args.gradient_accumulation
-        loss.backward()
+        loss = model(**batch, labels=labels).loss
+        scaled_loss =  loss/ args.gradient_accumulation
+        scaled_loss.backward()
 
         if global_step % args.gradient_accumulation != 0:
             continue
 
         # The below code is only executed during the update step
-        update_step += 1
         optimizer.step()
         scheduler.step()
         optimizer.zero_grad()
+        update_step += 1
+        update_time = time.time() - update_time
 
         if update_step % args.save_every == 0:
             logger.info(f"Saving model at update step {update_step}")
@@ -257,15 +271,22 @@ def main(args):
             model.merge_and_reinit()
 
         lr = scheduler.get_last_lr()[0]
+        tokens_in_update = tokens_seen - tokens_seen_before
+        tokens_seen_before = tokens_seen
+        batches_in_update = args.gradient_accumulation
 
         wandb.log({
             "loss": loss.item(),
             "lr": lr,
             "update_step": update_step,
             "tokens_seen": tokens_seen,
+            "throughput_tokens": tokens_in_update / update_time,
+            "throughput_examples": args.total_batch_size / update_time,
+            "throughput_batches": batches_in_update / update_time,
             },
             step=global_step,
         )
+        update_time = time.time()
 
     pbar.close()
     logger.info("Training finished")
