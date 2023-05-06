@@ -86,7 +86,7 @@ def main(args):
     if "LOCAL_RANK" in os.environ:
         args.local_rank = int(os.environ["LOCAL_RANK"])  # support torchrun
 
-    deepspeed.init_distributed()
+    deepspeed.init_distributed(distributed_port=os.environ.get("MASTER_PORT", 29500))
 
     global_rank = torch.distributed.get_rank()
     local_rank = global_rank % torch.cuda.device_count()
