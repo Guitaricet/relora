@@ -257,7 +257,7 @@ def main(args):
     }
     if args.dtype == "bfloat16":
         deepspeed_config["bf16"] = {"enabled": True}
-    elif args.dtype == "fp16":
+    elif args.dtype in ["fp16", "float16"]:
         deepspeed_config["fp16"] = DEFAULT_FP16_CONFIG
     
     _config["deepspeed_config"] = deepspeed_config
@@ -269,6 +269,7 @@ def main(args):
         pbar = tqdm(total=args.num_training_steps * args.gradient_accumulation)
 
     # DeepSpeed optimizer uses more memory than PyTorch optimizer
+    logger.info("Initializing optimizer and scheduler")
     optimizer = torch.optim.Adam(trainable_params, lr=args.lr)
     scheduler = transformers.get_linear_schedule_with_warmup(
         optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=args.num_training_steps,
@@ -302,7 +303,7 @@ def main(args):
         batch = {k: v.to(device) for k, v in batch.items()}
         labels = batch["input_ids"].clone()
         labels[labels == pad_idx] = -100
-        tokens_seen += (batch["input_ids"] != pad_idx).sum().item()
+        tokens_seen += (batch["input_ids"] != pad_idx).sum().item() * world_size
 
         loss = model_engine(**batch, labels=labels).loss
         model_engine.backward(loss)
