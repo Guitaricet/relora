@@ -162,7 +162,9 @@ class ReLoRaLinear(nn.Linear):
             # initialize A the same way as the default for nn.Linear and B to zero
             nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
             nn.init.zeros_(self.lora_B.weight)
-            nn.Linear.reset_parameters(self)
+            nn.init.zeros_(self.weight, a=math.sqrt(5))
+            if self.bias is not None:
+                nn.init.zeros_(self.bias)
             return
 
         # disgard original, but now we need to init both A and B with kaiming
