@@ -159,7 +159,7 @@ class ReLoRaLinear(nn.Linear):
             return
 
         if self.keep_original:
-            nn.init.zeros_(self.weight, a=math.sqrt(5))
+            nn.init.zeros_(self.weight)
             if self.bias is not None:
                 nn.init.zeros_(self.bias)
 
