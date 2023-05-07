@@ -50,6 +50,7 @@ def parse_args(args):
 
     parser.add_argument("--train_ln", default=True, action="store_true")
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--scheduler", type=str, default="cosine")
     parser.add_argument("--gradient_accumulation", type=int, default=1)
     parser.add_argument("--activation_checkpointing", action="store_true")
     parser.add_argument("--weight_decay", type=float, default=0.0)
@@ -83,11 +84,33 @@ def parse_args(args):
     return args
 
 
+def get_scheculer(optimizer, scheduler_type, num_training_steps, warmup_steps):
+    if scheduler_type == "linear":
+        return transformers.get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=num_training_steps,
+        )
+    if scheduler_type == "cosine":
+        return transformers.get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=num_training_steps,
+        )
+    raise NotImplementedError(f"Scheduler {scheduler_type} is not implemented")
+
+
 def main(args):
     if "LOCAL_RANK" in os.environ:
         args.local_rank = int(os.environ["LOCAL_RANK"])  # support torchrun
 
-    deepspeed.init_distributed(distributed_port=args.distributed_port)
+    # assumes that we are using a single node
+    deepspeed.init_distributed(
+        distributed_port=args.distributed_port,
+        init_method=f"tcp://127.0.0.1:{args.distributed_port}",
+        rank=args.local_rank,
+        world_size=torch.cuda.device_count(),
+    )
 
     global_rank = torch.distributed.get_rank()
     local_rank = global_rank % torch.cuda.device_count()
@@ -272,9 +295,7 @@ def main(args):
     # DeepSpeed optimizer uses more memory than PyTorch optimizer
     logger.info("Initializing optimizer and scheduler")
     optimizer = torch.optim.Adam(trainable_params, lr=args.lr)
-    scheduler = transformers.get_linear_schedule_with_warmup(
-        optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=args.num_training_steps,
-    )
+    scheduler = get_scheculer(optimizer, args.scheduler, args.num_training_steps, args.warmup_steps)
 
     model_engine, optimizer, _, _ = deepspeed.initialize(
         args=args,
@@ -290,6 +311,7 @@ def main(args):
     update_step = 0
     tokens_seen = 0
     tokens_seen_before = 0
+    n_lora_restarts = 0
     pad_idx = tokenizer.pad_token_id
     update_time = time.time()
 
@@ -317,6 +339,8 @@ def main(args):
         update_step += 1
         update_time = time.time() - update_time
 
+
+
         if update_step % args.save_every == 0:
             logger.info(f"Saving model and optimizer at update step {update_step}")
             os.makedirs(args.save_dir, exist_ok=True)
@@ -327,6 +351,7 @@ def main(args):
             model_engine.save_checkpoint(f"{current_model_directory}/deepspeed_checkpoint")
 
         if args.relora and global_step % update_step == 0:
+            n_lora_restarts += 1
             model_engine.module.merge_and_reinit()
 
         lr = optimizer.param_groups[0]["lr"]
@@ -343,6 +368,7 @@ def main(args):
                 "throughput_tokens": tokens_in_update / update_time,
                 "throughput_examples": args.total_batch_size / update_time,
                 "throughput_batches": batches_in_update / update_time,
+                "n_lora_restarts": n_lora_restarts,
                 },
                 step=global_step,
             )
