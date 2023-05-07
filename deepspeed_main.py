@@ -63,6 +63,7 @@ def parse_args(args):
     parser.add_argument("--dtype", type=str, default="bfloat16")
 
     parser.add_argument("--local_rank", type=int, default=None)
+    parser.add_argument("--distributed_port", type=int, default=29500)
     parser.add_argument("--stage", type=int, default=2, help="DeepSpeed ZeRo optimization stage")
 
     args = parser.parse_args(args)
@@ -86,7 +87,7 @@ def main(args):
     if "LOCAL_RANK" in os.environ:
         args.local_rank = int(os.environ["LOCAL_RANK"])  # support torchrun
 
-    deepspeed.init_distributed(distributed_port=os.environ.get("MASTER_PORT", 29500))
+    deepspeed.init_distributed(distributed_port=args.distributed_port)
 
     global_rank = torch.distributed.get_rank()
     local_rank = global_rank % torch.cuda.device_count()
