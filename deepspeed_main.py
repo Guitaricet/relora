@@ -19,6 +19,7 @@ import wandb
 from tqdm import tqdm
 from loguru import logger
 
+import peft_pretraining.training_utils as training_utils
 from peft_pretraining.relora import ReLoRaModel
 
 
@@ -84,22 +85,6 @@ def parse_args(args):
     return args
 
 
-def get_scheculer(optimizer, scheduler_type, num_training_steps, warmup_steps):
-    if scheduler_type == "linear":
-        return transformers.get_linear_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=num_training_steps,
-        )
-    if scheduler_type == "cosine":
-        return transformers.get_cosine_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=num_training_steps,
-        )
-    raise NotImplementedError(f"Scheduler {scheduler_type} is not implemented")
-
-
 def main(args):
     if "LOCAL_RANK" in os.environ:
         args.local_rank = int(os.environ["LOCAL_RANK"])  # support torchrun
@@ -119,8 +104,7 @@ def main(args):
     device = f"cuda:{local_rank}"
 
     # turn off logger
-    if global_rank != 0:
-        logger.remove()
+    if global_rank != 0: logger.remove()
 
     logger.info(f"Using DeepSpeed with rank {global_rank} (only rank 0 will log)")
     logger.info("*" * 40)
@@ -183,7 +167,7 @@ def main(args):
     data_mapped.batch = lambda batch_size: batch_fn(data_mapped, batch_size)
 
     model_config = AutoConfig.from_pretrained(args.model_config)
-    model = AutoModelForCausalLM.from_config(model_config)
+    model: LlamaForCausalLM = AutoModelForCausalLM.from_config(model_config)
     if args.activation_checkpointing:
         model.gradient_checkpointing_enable()
 
@@ -227,6 +211,9 @@ def main(args):
     logger.info(f"Total params before LoRA: {params_before / 1_000_000:.2f}M")
     logger.info(f"Total params after  LoRA: {params_after / 1_000_000:.2f}M")
     logger.info(f"Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1_000_000:.2f}M")
+
+    if args.save_dir:
+        logger.info(f"Saving model to {args.save_dir} every {args.save_every} update steps")
 
     if args.use_peft and args.relora is not None:
         if (params_after <= params_before):
@@ -293,9 +280,8 @@ def main(args):
         pbar = tqdm(total=args.num_training_steps * args.gradient_accumulation)
 
     # DeepSpeed optimizer uses more memory than PyTorch optimizer
-    logger.info("Initializing optimizer and scheduler")
-    optimizer = torch.optim.Adam(trainable_params, lr=args.lr)
-    scheduler = get_scheculer(optimizer, args.scheduler, args.num_training_steps, args.warmup_steps)
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = training_utils.get_scheculer(optimizer, args.scheduler, args.num_training_steps, args.warmup_steps)
 
     model_engine, optimizer, _, _ = deepspeed.initialize(
         args=args,
@@ -339,8 +325,6 @@ def main(args):
         update_step += 1
         update_time = time.time() - update_time
 
-
-
         if update_step % args.save_every == 0:
             logger.info(f"Saving model and optimizer at update step {update_step}")
             os.makedirs(args.save_dir, exist_ok=True)
@@ -350,7 +334,8 @@ def main(args):
             # I think it should save both model and optimizer this way
             model_engine.save_checkpoint(f"{current_model_directory}/deepspeed_checkpoint")
 
-        if args.relora and global_step % update_step == 0:
+        if args.relora and update_step % args.relora == 0:
+            logger.info("In merge and reinit")
             n_lora_restarts += 1
             model_engine.module.merge_and_reinit()
 
@@ -373,6 +358,18 @@ def main(args):
                 step=global_step,
             )
         update_time = time.time()
+
+    if global_rank == 0:
+        pbar.close()
+        logger.info("Training finished. Saving final model and optimizer state.")
+        logger.info(f"Saving model and optimizer at update step {update_step}")
+        os.makedirs(args.save_dir, exist_ok=True)
+        current_model_directory = f"{args.save_dir}/model_{update_step}"
+        model.save_pretrained(current_model_directory)  # won't work with Stage 3
+        model_engine.save_checkpoint(f"{current_model_directory}/deepspeed_checkpoint")
+
+    logger.info("Script finished successfully")
+    print(f"Rank {global_rank} finished successfully")
 
 
 if __name__ == "__main__":
