@@ -62,6 +62,12 @@ def parse_args(args):
     if args.tags is not None:
         args.tags = args.tags.split(",")
 
+    if not args.use_peft:
+        # just for more clear hparam logging to wandb
+        args.relora = None
+        args.lora_r = None
+        args.force_keep_original = False
+
     return args
 
 

@@ -79,6 +79,12 @@ def parse_args(args):
         # use checkpoints / model name, date and time as save directory
         args.save_dir = f"checkpoints/{args.model_config.split('/')[-1].rstrip('.json')}-{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}"
 
+    if not args.use_peft:
+        # just for more clear hparam logging to wandb
+        args.relora = None
+        args.lora_r = None
+        args.force_keep_original = False
+
     if args.stage == 3:
         logger.error("Model saving is not impelmented for DeepSpeed ZeRo Stage 3")
         raise NotImplementedError("Model saving is not impelmented for DeepSpeed ZeRo Stage 3")
