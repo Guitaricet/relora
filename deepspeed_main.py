@@ -237,10 +237,9 @@ def main(args):
     _config = dict(vars(args))
     _config["max_lr"] = _config.pop("lr")  # rename lr to max_lr to avoid conflicts with scheduler
     _config_ext = {
-        "total_params": n_total_params,
         "total_params_M": n_total_params / 1_000_000,
-        "trainable_params": n_trainable_params,
         "trainable_params_M": n_trainable_params / 1_000_000,
+        "equivalent_params_M": params_before / 1_000_000,
         "percent_trainable_params": p_trainable_params,
         "name_trainable_params": trainable_params_names,
         "dataset": dataset_name,
