@@ -62,6 +62,7 @@ def parse_args(args):
                              "Notice that gradient accumulation is taken into account.")
     parser.add_argument("--save_every", type=int, default=10_000)
     parser.add_argument("--save_dir", type=str, default=None)
+    parser.add_argument("--tags", type=str, default=None)
     parser.add_argument("--dtype", type=str, default="bfloat16")
 
     parser.add_argument("--local_rank", type=int, default=None)
@@ -81,6 +82,9 @@ def parse_args(args):
     if args.stage == 3:
         logger.error("Model saving is not impelmented for DeepSpeed ZeRo Stage 3")
         raise NotImplementedError("Model saving is not impelmented for DeepSpeed ZeRo Stage 3")
+
+    if args.tags is not None:
+        args.tags = args.tags.split(",")
 
     return args
 
@@ -275,7 +279,7 @@ def main(args):
     logger.info("DeepSpeed config:")
     logger.info(pformat(deepspeed_config))
     if global_rank == 0:
-        wandb.init(project="peft_pretraining", config=_config)
+        wandb.init(project="peft_pretraining", config=_config, tags=args.tags)
         wandb.save(os.path.abspath(__file__), policy="now") # save current script
         pbar = tqdm(total=args.num_training_steps * args.gradient_accumulation)
 

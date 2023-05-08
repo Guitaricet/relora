@@ -45,6 +45,7 @@ def parse_args(args):
                         help="Number of **update steps** to train for. "
                              "Notice that gradient accumulation is taken into account.")
     parser.add_argument("--save_every", type=int, default=10_000)
+    parser.add_argument("--tags", type=str, default=None)
     parser.add_argument("--save_dir", type=str, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--dtype", type=str, default="bfloat16")
@@ -57,6 +58,9 @@ def parse_args(args):
     if args.save_dir is None:
         # use checkpoints / model name, date and time as save directory
         args.save_dir = f"checkpoints/{args.model_config.split('/')[-1].rstrip('.json')}-{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}"
+
+    if args.tags is not None:
+        args.tags = args.tags.split(",")
 
     return args
 
@@ -211,7 +215,7 @@ def main(args):
             "target_modules": ["attn", "mlp"],
         }
 
-    wandb.init(project="peft_pretraining", config=_config)
+    wandb.init(project="peft_pretraining", config=_config, tags=args.tags)
     pbar = tqdm(total=args.num_training_steps * args.gradient_accumulation)
 
     model = model.to(device, dtype=getattr(torch, args.dtype))
