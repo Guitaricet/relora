@@ -40,6 +40,8 @@ def parse_args(args):
     parser.add_argument("--model_config", type=str, required=True)
 
     parser.add_argument("--batch_size", type=int, required=True)
+    parser.add_argument("--gradient_accumulation", type=int, default=None)
+    parser.add_argument("--total_batch_size", type=int, default=None)
     parser.add_argument("--max_length", type=int, default=256)
 
     parser.add_argument("--use_peft", action="store_true")
@@ -53,7 +55,6 @@ def parse_args(args):
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--scheduler", type=str, default="cosine")
     parser.add_argument("--min_lr_ratio", type=float, default=0.1)
-    parser.add_argument("--gradient_accumulation", type=int, default=1)
     parser.add_argument("--activation_checkpointing", action="store_true")
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--warmup_steps", type=int, default=1_000)
@@ -93,6 +94,12 @@ def parse_args(args):
     if args.tags is not None:
         args.tags = args.tags.split(",")
 
+    if args.total_batch_size is None:
+        args.gradient_accumulation = args.gradient_accumulation or 1
+        args.total_batch_size = args.batch_size * args.gradient_accumulation
+
+    assert args.total_batch_size % args.batch_size == 0, "total_batch_size must be divisible by batch_size"
+
     return args
 
 
@@ -111,8 +118,16 @@ def main(args):
     global_rank = torch.distributed.get_rank()
     local_rank = global_rank % torch.cuda.device_count()
     world_size = torch.distributed.get_world_size()
-    args.total_batch_size = args.batch_size * args.gradient_accumulation * world_size
     device = f"cuda:{local_rank}"
+
+    if args.total_batch_size is not None:
+        if args.gradient_accumulation is None:
+            assert args.total_batch_size % world_size == 0, "total_batch_size must be divisible by world_size"
+            args.gradient_accumulation = args.total_batch_size // (args.batch_size * world_size)
+            assert args.gradient_accumulation > 0, "gradient_accumulation must be greater than 0"
+
+    assert args.gradient_accumulation * args.batch_size * world_size == args.total_batch_size, \
+        "gradient_accumulation * batch_size * world_size must be equal to total_batch_size"
 
     # turn off logger
     if global_rank != 0: logger.remove()

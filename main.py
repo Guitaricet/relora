@@ -24,6 +24,8 @@ def parse_args(args):
     parser.add_argument("--model_config", type=str, required=True)
 
     parser.add_argument("--batch_size", type=int, required=True)
+    parser.add_argument("--gradient_accumulation", type=int, default=None)
+    parser.add_argument("--total_batch_size", type=int, default=None)
     parser.add_argument("--max_length", type=int, default=256)
 
     parser.add_argument("--use_peft", action="store_true")
@@ -37,7 +39,6 @@ def parse_args(args):
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--scheduler", type=str, default="cosine")
     parser.add_argument("--min_lr_ratio", type=float, default=0.1)
-    parser.add_argument("--gradient_accumulation", type=int, default=1)
     parser.add_argument("--activation_checkpointing", action="store_true")
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--warmup_steps", type=int, default=1_000)
@@ -68,13 +69,24 @@ def parse_args(args):
         args.relora = None
         args.lora_r = None
         args.force_keep_original = False
+    
+    if args.total_batch_size is None:
+        args.gradient_accumulation = args.gradient_accumulation or 1
+        args.total_batch_size = args.batch_size * args.gradient_accumulation
+
+    assert args.total_batch_size % args.batch_size == 0, "total_batch_size must be divisible by batch_size"
 
     return args
 
 
 def main(args):
-    args.total_batch_size = args.batch_size * args.gradient_accumulation
     device = args.device or "cuda"
+    if args.total_batch_size is not None:
+        if args.gradient_accumulation is None:
+            args.gradient_accumulation = args.total_batch_size // args.batch_size
+
+    assert args.batch_size * args.gradient_accumulation == args.total_batch_size, \
+        "batch_size * gradient_accumulation must be equal to total_batch_size"
 
     logger.info("*" * 40)
     logger.info(f"Starting training with the arguments")
