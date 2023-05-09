@@ -6,6 +6,8 @@
 pip install -r requirements.txt
 ```
 
+and maybe `sudo apt-get install g++` for deepspeed (on some instances)
+
 ## Usage
 
 It's important to provide `--train_ln` when training with PEFT.
