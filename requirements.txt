@@ -6,3 +6,4 @@ peft
 wandb
 loguru
 deepspeed
+nvitop
