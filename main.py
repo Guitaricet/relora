@@ -46,7 +46,7 @@ def parse_args(args):
     parser.add_argument("--num_training_steps", type=int, default=10_000,
                         help="Number of **update steps** to train for. "
                              "Notice that gradient accumulation is taken into account.")
-    parser.add_argument("--max_train_tokens", type=int, default=None,
+    parser.add_argument("--max_train_tokens", type=training_utils.max_train_tokens_to_number, default=None,
                         help="Number of tokens to train on. Overwrites num_training_steps. "
                              "You can use M and B suffixes, e.g. 100M or 1B.")
     parser.add_argument("--save_every", type=int, default=10_000)
@@ -80,12 +80,6 @@ def parse_args(args):
     assert args.total_batch_size % args.batch_size == 0, "total_batch_size must be divisible by batch_size"
 
     if args.max_train_tokens is not None:
-        if args.max_train_tokens.endswith("M"):
-            args.max_train_tokens = int(args.max_train_tokens.rstrip("M")) * 1_000_000
-        elif args.max_train_tokens.endswith("B"):
-            args.max_train_tokens = int(args.max_train_tokens.rstrip("B")) * 1_000_000_000
-        else:
-            args.max_train_tokens = int(args.max_train_tokens)
         args.num_training_steps = args.max_train_tokens // args.total_batch_size
         logger.info(f"Training for {args.num_training_steps} update steps")
 

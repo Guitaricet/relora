@@ -61,3 +61,12 @@ def batch_fn(dataset, batch_size):
             batch = []
     if len(batch) > 0:
         yield batch
+
+
+def max_train_tokens_to_number(max_train_tokens):
+    if max_train_tokens.endswith("M"):
+        return int(max_train_tokens.rstrip("M")) * 1_000_000
+    elif max_train_tokens.endswith("B"):
+        return int(max_train_tokens.rstrip("B")) * 1_000_000_000
+    else:
+        return int(max_train_tokens)
