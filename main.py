@@ -82,12 +82,12 @@ def main(args):
     logger.info("*" * 40)
 
     dataset_name = "c4"  # switch to "togethercomputer/RedPajama-Data-1T" later
-    if dataset_name == "c4":
-        data = datasets.load_dataset("c4", "en", split="train", streaming=True)
-    else:
-        data = datasets.load_dataset(dataset_name, split="train", streaming=True)
+    assert dataset_name == "c4"
+    data = datasets.load_dataset("c4", "en", split="train", streaming=True)
+    val_data = datasets.load_dataset("c4", "en", split="validation", streaming=True)
 
-    data = data.shuffle(seed=42)
+    data: datasets.Dataset = data.shuffle(seed=42)
+    val_data: datasets.Dataset = val_data.shuffle(seed=42)  # not sure if C4 val set is shuffled originally
 
     # it doesn't matter which tokenizer we use, because we train from scratch
     # T5 tokenizer was trained on C4 and we are also training on C4, so it's a good choice
@@ -109,27 +109,9 @@ def main(args):
         remove_columns=["text", "timestamp", "url"],
     )
 
-    def collate_fn(batch_list):
-        batch = {
-            "input_ids": torch.stack([example["input_ids"] for example in batch_list]),
-            "attention_mask": torch.stack([example["attention_mask"] for example in batch_list]),
-        }
-        return batch
-
-    def batch_fn(dataset, batch_size):
-        batch = []
-        for example in dataset:
-            batch.append(example)
-            if len(batch) == batch_size:
-                batch = collate_fn(batch)
-                yield batch
-                batch = []
-        if len(batch) > 0:
-            yield batch
-
     # Very inefficient, but we are bottlenecked by the model anyway
     # as long as the model is large enough
-    data_mapped.batch = lambda batch_size: batch_fn(data_mapped, batch_size)
+    data_mapped.batch = lambda batch_size: training_utils.batch_fn(data_mapped, batch_size)
 
     model_config = AutoConfig.from_pretrained(args.model_config)
     model: LlamaForCausalLM = AutoModelForCausalLM.from_config(model_config)
@@ -153,8 +135,7 @@ def main(args):
         )
 
         for name, param in model.named_parameters():
-            # LLaMa
-            # model.norm, model.layers.input_layernorm, model.layers.post_attention_layernorm
+            # LLaMa: model.norm, model.layers.input_layernorm, model.layers.post_attention_layernorm
             if args.train_ln and "norm" in name:
                 param.requires_grad = True        
             elif "lm_head" in name:
@@ -194,7 +175,7 @@ def main(args):
     trainable_params = (p for p in model.parameters() if p.requires_grad)
     trainable_params_names = [name for name, p in model.named_parameters() if p.requires_grad]
 
-    # from args
+    # Initialize wandb
     _config = dict(vars(args))
     _config["max_lr"] = _config.pop("lr")  # rename lr to max_lr
     _config_ext = {

@@ -124,12 +124,12 @@ def main(args):
     logger.info("*" * 40)
 
     dataset_name = "c4"  # switch to "togethercomputer/RedPajama-Data-1T" later
-    if dataset_name == "c4":
-        data = datasets.load_dataset("c4", "en", split="train", streaming=True)
-    else:
-        data = datasets.load_dataset(dataset_name, split="train", streaming=True)
+    assert dataset_name == "c4"
+    data = datasets.load_dataset("c4", "en", split="train", streaming=True)
+    val_data = datasets.load_dataset("c4", "en", split="validation", streaming=True)
 
-    data = data.shuffle(seed=42)
+    data: datasets.Dataset = data.shuffle(seed=42)
+    val_data: datasets.Dataset = val_data.shuffle(seed=42)  # not sure if C4 val set is shuffled originally
     data = datasets.distributed.split_dataset_by_node(
         data, rank=global_rank, world_size=world_size,
     )
@@ -154,27 +154,9 @@ def main(args):
         remove_columns=["text", "timestamp", "url"],
     )
 
-    def collate_fn(batch_list):
-        batch = {
-            "input_ids": torch.stack([example["input_ids"] for example in batch_list]),
-            "attention_mask": torch.stack([example["attention_mask"] for example in batch_list]),
-        }
-        return batch
-
-    def batch_fn(dataset, batch_size):
-        batch = []
-        for example in dataset:
-            batch.append(example)
-            if len(batch) == batch_size:
-                batch = collate_fn(batch)
-                yield batch
-                batch = []
-        if len(batch) > 0:
-            yield batch
-
     # Very inefficient, but we are bottlenecked by the model anyway
     # as long as the model is large enough
-    data_mapped.batch = lambda batch_size: batch_fn(data_mapped, batch_size)
+    data_mapped.batch = lambda batch_size: training_utils.batch_fn(data_mapped, batch_size)
 
     model_config = AutoConfig.from_pretrained(args.model_config)
     model: LlamaForCausalLM = AutoModelForCausalLM.from_config(model_config)
@@ -198,8 +180,7 @@ def main(args):
         )
 
         for name, param in model.named_parameters():
-            # LLaMa
-            # model.norm, model.layers.input_layernorm, model.layers.post_attention_layernorm
+            # LLaMa: model.norm, model.layers.input_layernorm, model.layers.post_attention_layernorm
             if args.train_ln and "norm" in name:
                 param.requires_grad = True        
             elif "lm_head" in name:
@@ -316,6 +297,7 @@ def main(args):
         if global_rank == 0: pbar.update(1)
         if global_step > args.num_training_steps * args.gradient_accumulation:
             logger.info(f"Reached max number of update steps (f{args.num_training_steps}). Stopping training.")
+            print(f"Rank {global_rank} stopping training.")
             break
 
         batch = {k: v.to(device) for k, v in batch.items()}
@@ -338,7 +320,8 @@ def main(args):
             logger.info(f"Saving model and optimizer at update step {update_step}")
             os.makedirs(args.save_dir, exist_ok=True)
             current_model_directory = f"{args.save_dir}/model_{update_step}"
-            model.save_pretrained(current_model_directory)  # won't work with Stage 3
+            if global_rank == 0:
+                model.save_pretrained(current_model_directory)  # won't work with Stage 3
 
             # I think it should save both model and optimizer this way
             model_engine.save_checkpoint(f"{current_model_directory}/deepspeed_checkpoint")
@@ -368,14 +351,57 @@ def main(args):
             )
         update_time = time.time()
 
+    logger.info("Training finished. Saving final model and optimizer state.")
+    logger.info(f"Saving model and optimizer at update step {update_step}")
+    current_model_directory = f"{args.save_dir}/model_{update_step}"
     if global_rank == 0:
         pbar.close()
-        logger.info("Training finished. Saving final model and optimizer state.")
-        logger.info(f"Saving model and optimizer at update step {update_step}")
         os.makedirs(args.save_dir, exist_ok=True)
-        current_model_directory = f"{args.save_dir}/model_{update_step}"
         model.save_pretrained(current_model_directory)  # won't work with Stage 3
-        model_engine.save_checkpoint(f"{current_model_directory}/deepspeed_checkpoint")
+
+    model_engine.save_checkpoint(f"{current_model_directory}/deepspeed_checkpoint")
+
+    # Final evaluation
+    logger.info("Running final evaluation")
+    val_data = datasets.distributed.split_dataset_by_node(
+        val_data, rank=global_rank, world_size=world_size,
+    )
+    val_data_mapped = val_data.map(
+        preprocess_batched,
+        batched=True,
+        remove_columns=["text", "timestamp", "url"],
+    )
+    val_data_mapped.batch = lambda batch_size: training_utils.batch_fn(val_data_mapped, batch_size)
+
+    target_eval_tokens = 10_000_000
+    evaluated_on_tokens = 0
+    total_loss = 0.0
+    for batch in val_data_mapped.batch(batch_size=args.batch_size):
+        if evaluated_on_tokens > target_eval_tokens:
+            break
+
+        batch = {k: v.to(device) for k, v in batch.items()}
+        labels = batch["input_ids"].clone()
+        labels[labels == pad_idx] = -100
+        loss = model_engine(**batch, labels=labels).loss
+        total_loss += loss.item()
+
+        evaluated_on_tokens += (batch["input_ids"] != pad_idx).sum().item() * world_size
+
+    # gather across all GPUs
+    losses = torch.tensor([total_loss], device=device)
+    torch.distributed.all_gather(losses, losses)
+    losses = losses.cpu().numpy().sum() / world_size
+    total_loss = losses
+
+    if global_rank == 0:
+        wandb.log({
+            "final_eval_loss": total_loss,
+            "final_eval_tokens": evaluated_on_tokens,
+            },
+            step=global_step,
+        )
+        logger.info(f"Final eval loss: {total_loss}")
 
     logger.info("Script finished successfully")
     print(f"Rank {global_rank} finished successfully")
