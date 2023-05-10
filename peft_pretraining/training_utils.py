@@ -45,19 +45,16 @@ def get_cyclical_cosine_schedule_with_min_lr(optimizer, num_warmup_steps, num_tr
     if num_training_steps % cycle_length != 0:
         raise ValueError(f"num_training_steps ({num_training_steps}) must be divisible by cycle_length ({cycle_length})")
 
-    num_cycles = int(num_training_steps / cycle_length)
-
     lr_lambda = partial(
         _get_cyclical_cosine_schedule_with_min_lr_lambda,
         num_warmup_steps=num_warmup_steps,
         cycle_length=cycle_length,
-        num_cycles=num_cycles,
         min_lr_ratio=min_lr_ratio,
     )
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 
 
-def _get_cyclical_cosine_schedule_with_min_lr_lambda(current_step, *, num_warmup_steps, cycle_length, num_cycles, min_lr_ratio):
+def _get_cyclical_cosine_schedule_with_min_lr_lambda(current_step, *, num_warmup_steps, cycle_length, min_lr_ratio):
     assert 0 < min_lr_ratio <= 1.0, "min_lr_ratio must be in (0,1]"
 
     # compute where we are in the current cycle
@@ -67,17 +64,17 @@ def _get_cyclical_cosine_schedule_with_min_lr_lambda(current_step, *, num_warmup
         return float(cycle_step) / float(max(1, num_warmup_steps))
     
     progress = float(cycle_step - num_warmup_steps) / float(max(1, cycle_length - num_warmup_steps))
-    cosine_decay = 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress))
+    cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
     
     return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
 
 
-def _get_cosine_schedule_with_min_lr_lambda(current_step, *, num_warmup_steps, num_training_steps, num_cycles, min_lr_ratio):
+def _get_cosine_schedule_with_min_lr_lambda(current_step, *, num_warmup_steps, num_training_steps, min_lr_ratio):
     assert 0 < min_lr_ratio <= 1.0, "min_lr_ratio must be in (0,1]"
     if current_step < num_warmup_steps:
         return float(current_step) / float(max(1, num_warmup_steps))
     progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
-    cosine_decay = 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress))
+    cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
     return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
 
 
