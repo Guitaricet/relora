@@ -14,18 +14,11 @@ def get_scheculer(optimizer, scheduler_type, num_training_steps, warmup_steps, m
             num_training_steps=num_training_steps,
         )
     if scheduler_type == "cosine":
-        return get_cosine_schedule_with_min_lr(
-            optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=num_training_steps,
-            min_lr_ratio=min_lr_ratio,
-        )
-    if scheduler_type == "cyclical_cosine":
         return get_cyclical_cosine_schedule_with_min_lr(
             optimizer,
             num_warmup_steps=warmup_steps,
-            cycle_length=cycle_length,
             num_training_steps=num_training_steps,
+            cycle_length=cycle_length,
             min_lr_ratio=min_lr_ratio,
         )
 
@@ -43,7 +36,17 @@ def get_cosine_schedule_with_min_lr(optimizer, num_warmup_steps, num_training_st
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 
 
-def get_cyclical_cosine_schedule_with_min_lr(optimizer, num_warmup_steps, cycle_length, num_cycles=0.5, min_lr_ratio=0.1, last_epoch=-1):
+def get_cyclical_cosine_schedule_with_min_lr(optimizer, num_warmup_steps, num_training_steps, cycle_length, min_lr_ratio=0.1, last_epoch=-1):
+    assert cycle_length is not None or num_training_steps is not None, "You must specify either cycle_length or num_training_steps"
+    
+    if cycle_length is None:
+        cycle_length = num_training_steps
+
+    if num_training_steps % cycle_length != 0:
+        raise ValueError(f"num_training_steps ({num_training_steps}) must be divisible by cycle_length ({cycle_length})")
+
+    num_cycles = int(num_training_steps / cycle_length)
+
     lr_lambda = partial(
         _get_cyclical_cosine_schedule_with_min_lr_lambda,
         num_warmup_steps=num_warmup_steps,
@@ -56,7 +59,7 @@ def get_cyclical_cosine_schedule_with_min_lr(optimizer, num_warmup_steps, cycle_
 
 def _get_cyclical_cosine_schedule_with_min_lr_lambda(current_step, *, num_warmup_steps, cycle_length, num_cycles, min_lr_ratio):
     assert 0 < min_lr_ratio <= 1.0, "min_lr_ratio must be in (0,1]"
-    
+
     # compute where we are in the current cycle
     cycle_step = current_step % cycle_length
     

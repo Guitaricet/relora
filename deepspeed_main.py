@@ -54,6 +54,7 @@ def parse_args(args):
     parser.add_argument("--train_ln", default=True, action="store_true")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--scheduler", type=str, default="cosine")
+    parser.add_argument("--cycle_length", type=int, default=None, help="Number of steps per cycle for cosine scheduler")
     parser.add_argument("--min_lr_ratio", type=float, default=0.1)
     parser.add_argument("--activation_checkpointing", action="store_true")
     parser.add_argument("--weight_decay", type=float, default=0.0)
@@ -295,7 +296,12 @@ def main(args):
     # DeepSpeed optimizer uses more memory than PyTorch optimizer
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
     scheduler = training_utils.get_scheculer(
-        optimizer, args.scheduler, args.num_training_steps, args.warmup_steps, args.min_lr_ratio,
+        optimizer=optimizer,
+        scheduler_type=args.scheduler,
+        num_training_steps=args.num_training_steps,
+        warmup_steps=args.warmup_steps,
+        min_lr_ratio=args.min_lr_ratio,
+        cycle_length=args.cycle_length,
     )
 
     model_engine, optimizer, _, _ = deepspeed.initialize(
