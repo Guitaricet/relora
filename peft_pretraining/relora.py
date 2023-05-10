@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from transformers import AutoModel, AutoConfig
+from transformers import AutoModelForCausalLM, LlamaForCausalLM, AutoConfig
 
 
 @dataclass
@@ -94,19 +94,18 @@ class ReLoRaModel(torch.nn.Module):
     
     @classmethod
     def from_pretrained(cls, path):
-        # NOT TESTED
         with open(os.path.join(path, "relora_config.json"), "r") as f:
             relora_config = json.load(f)
-        with open(os.path.join(path, "config.json"), "r") as f:
-            config = json.load(f)
 
-        base_model = AutoModel.from_config(config)
+        config = AutoConfig.from_pretrained(path)
+
+        base_model = AutoModelForCausalLM.from_config(config)
         model = cls(base_model, **relora_config)
 
         with open(os.path.join(path, "pytorch_model.bin"), "rb") as f:
             state_dict = torch.load(f, map_location="cpu")
-        
-        model.load_state_dict(state_dict, strict=True)
+
+        model.wrapped_model.load_state_dict(state_dict, strict=True)
         return model
 
 

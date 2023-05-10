@@ -388,6 +388,11 @@ def main(args):
 
     # Final evaluation
     logger.info("Running final evaluation")
+    model_engine.eval()
+    del loss, optimizer, scheduler
+    import gc; gc.collect()
+    torch.cuda.empty_cache()
+
     val_data = datasets.distributed.split_dataset_by_node(
         val_data, rank=global_rank, world_size=world_size,
     )
@@ -401,23 +406,23 @@ def main(args):
     target_eval_tokens = 10_000_000
     evaluated_on_tokens = 0
     total_loss = 0.0
-    for batch in val_data_mapped.batch(batch_size=args.batch_size):
-        if evaluated_on_tokens > target_eval_tokens:
-            break
+    with torch.no_grad():
+        for batch in val_data_mapped.batch(batch_size=args.batch_size):
+            if evaluated_on_tokens > target_eval_tokens:
+                break
 
-        batch = {k: v.to(device) for k, v in batch.items()}
-        labels = batch["input_ids"].clone()
-        labels[labels == pad_idx] = -100
-        loss = model_engine(**batch, labels=labels).loss
-        total_loss += loss.item()
+            batch = {k: v.to(device) for k, v in batch.items()}
+            labels = batch["input_ids"].clone()
+            labels[labels == pad_idx] = -100
+            loss = model_engine(**batch, labels=labels).loss
+            total_loss += loss.item()
 
-        evaluated_on_tokens += (batch["input_ids"] != pad_idx).sum().item() * world_size
+            evaluated_on_tokens += (batch["input_ids"] != pad_idx).sum().item() * world_size
 
     # gather across all GPUs
-    losses = torch.tensor([total_loss], device=device)
-    torch.distributed.all_gather(losses, losses)
-    losses = losses.cpu().numpy().sum() / world_size
-    total_loss = losses
+    gathered_losses = [torch.zeros_like(total_loss) for _ in range(world_size)]
+    torch.distributed.all_gather(gathered_losses, total_loss)
+    total_loss = sum([t.item() for t in gathered_losses]) / world_size
 
     if global_rank == 0:
         wandb.log({
