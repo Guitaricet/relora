@@ -25,17 +25,6 @@ def get_scheculer(optimizer, scheduler_type, num_training_steps, warmup_steps, m
     raise NotImplementedError(f"Scheduler {scheduler_type} is not implemented")
 
 
-def get_cosine_schedule_with_min_lr(optimizer, num_warmup_steps, num_training_steps, num_cycles=0.5, min_lr_ratio=0.1, last_epoch=-1):
-    lr_lambda = partial(
-        _get_cosine_schedule_with_min_lr_lambda,
-        num_warmup_steps=num_warmup_steps,
-        num_training_steps=num_training_steps,
-        num_cycles=num_cycles,
-        min_lr_ratio=min_lr_ratio,
-    )
-    return LambdaLR(optimizer, lr_lambda, last_epoch)
-
-
 def get_cyclical_cosine_schedule_with_min_lr(optimizer, num_warmup_steps, num_training_steps, cycle_length, min_lr_ratio=0.1, last_epoch=-1):
     assert cycle_length is not None or num_training_steps is not None, "You must specify either cycle_length or num_training_steps"
     
@@ -61,20 +50,15 @@ def _get_cyclical_cosine_schedule_with_min_lr_lambda(current_step, *, num_warmup
     cycle_step = current_step % cycle_length
     
     if cycle_step < num_warmup_steps:
+        if cycle_step < 2:
+            return 0.0
+        if cycle_step < 5:
+            return 1e-7
         return float(cycle_step) / float(max(1, num_warmup_steps))
-    
+
     progress = float(cycle_step - num_warmup_steps) / float(max(1, cycle_length - num_warmup_steps))
     cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
     
-    return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
-
-
-def _get_cosine_schedule_with_min_lr_lambda(current_step, *, num_warmup_steps, num_training_steps, min_lr_ratio):
-    assert 0 < min_lr_ratio <= 1.0, "min_lr_ratio must be in (0,1]"
-    if current_step < num_warmup_steps:
-        return float(current_step) / float(max(1, num_warmup_steps))
-    progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
-    cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
     return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
 
 
