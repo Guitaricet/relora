@@ -430,7 +430,7 @@ def main(args):
             evaluated_on_tokens += (batch["input_ids"] != pad_idx).sum().item() * world_size
 
     # gather across all GPUs
-    gathered_losses = [torch.zeros_like(total_loss) for _ in range(world_size)]
+    gathered_losses = [torch.zeros_like(torch.tensor(total_loss)) for _ in range(world_size)]
     torch.distributed.all_gather(gathered_losses, total_loss)
     total_loss = sum([t.item() for t in gathered_losses]) / world_size
 
