@@ -50,10 +50,12 @@ def _get_cyclical_cosine_schedule_with_min_lr_lambda(current_step, *, num_warmup
     cycle_step = current_step % cycle_length
     
     if cycle_step < num_warmup_steps:
-        if cycle_step < 2:
-            return 0.0
-        if cycle_step < 5:
-            return 1e-7
+        if current_step != cycle_step:
+            # only do this after the first cycle
+            if cycle_step < 2:
+                return 0.0
+            if cycle_step < 5:
+                return 1e-7
         return float(cycle_step) / float(max(1, num_warmup_steps))
 
     progress = float(cycle_step - num_warmup_steps) / float(max(1, cycle_length - num_warmup_steps))
