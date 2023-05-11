@@ -69,7 +69,7 @@ def parse_args(args):
     parser.add_argument("--save_every", type=int, default=10_000)
     parser.add_argument("--save_dir", type=str, default=None)
     parser.add_argument("--tags", type=str, default=None)
-    parser.add_argument("--dtype", type=str, default="bfloat16")
+    parser.add_argument("--dtype", type=str, default="bfloat16" if torch.cuda.is_bf16_supported() else "float16")
 
     parser.add_argument("--local_rank", type=int, default=None)
     parser.add_argument("--distributed_port", type=int, default=29500)
