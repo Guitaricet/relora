@@ -207,7 +207,6 @@ def main(args):
         "name_trainable_params": trainable_params_names,
         "dataset": dataset_name,
         "model": model_config.to_dict(),
-        "scheduler": "linear",
         "device": str(device),
     }
     _config.update(_config_ext)
@@ -242,7 +241,7 @@ def main(args):
     for batch in data_mapped.batch(batch_size=args.batch_size):
         global_step += 1
         pbar.update(1)
-        if global_step > args.num_training_steps * args.gradient_accumulation:
+        if update_step > args.num_training_steps:
             logger.info(f"Reached max number of update steps (f{args.num_training_steps}). Stopping training.")
             break
 
