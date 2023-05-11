@@ -1,10 +1,13 @@
 import os
 import time
 import json
+import random
 import argparse
 from datetime import datetime
 from typing import Union
 from pprint import pformat
+
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -79,6 +82,7 @@ def parse_args(args):
     parser.add_argument("--local_rank", type=int, default=None)
     parser.add_argument("--distributed_port", type=int, default=29500)
     parser.add_argument("--stage", type=int, default=2, help="DeepSpeed ZeRo optimization stage")
+    parser.add_argument("--seed", type=int, default=0)
 
     args = parser.parse_args(args)
 
@@ -120,6 +124,11 @@ def parse_args(args):
 
 
 def main(args):
+    # seed all
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+
     if "LOCAL_RANK" in os.environ:
         args.local_rank = int(os.environ["LOCAL_RANK"])  # support torchrun
 
@@ -160,6 +169,7 @@ def main(args):
     data = datasets.load_dataset("c4", "en", split="train", streaming=True)
     val_data = datasets.load_dataset("c4", "en", split="validation", streaming=True)
 
+    # this seed is hard-coded to guarantee the same order of the examples (for any --seed)
     data: datasets.Dataset = data.shuffle(seed=42)
     val_data: datasets.Dataset = val_data.shuffle(seed=42)  # not sure if C4 val set is shuffled originally
     data = datasets.distributed.split_dataset_by_node(
