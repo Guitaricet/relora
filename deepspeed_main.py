@@ -396,6 +396,7 @@ def main(args):
         if local_step < 10 and global_rank == 0:
             # kind of logging this out of desperation
             logger.info(f"Loss at step {local_step}: {loss.item()}")
+            lr = optimizer.param_groups[0]["lr"]
             wandb.log({"loss": loss.item(), "lr": lr}, step=global_step)
 
         if not model_engine.is_gradient_accumulation_boundary():
