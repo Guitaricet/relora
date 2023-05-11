@@ -7,3 +7,4 @@ wandb
 loguru
 deepspeed
 nvitop
+lion-pytorch

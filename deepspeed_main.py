@@ -10,6 +10,7 @@ import torch.distributed
 
 import transformers
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM, LlamaForCausalLM
+from lion_pytorch import Lion
 
 import deepspeed
 import datasets
@@ -52,6 +53,7 @@ def parse_args(args):
                               "Useful for making sure that full-LoRa model is equivalent to model+LoRa."))
 
     parser.add_argument("--train_ln", default=True, action="store_true")
+    parser.add_argument("--optimizer", default="Adam", choices=["Adam", "Lion"])
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--scheduler", type=str, default="cosine")
     parser.add_argument("--cycle_length", type=int, default=None, help="Number of steps per cycle for cosine scheduler")
@@ -294,7 +296,13 @@ def main(args):
         pbar = tqdm(total=args.num_training_steps * args.gradient_accumulation)
 
     # DeepSpeed optimizer uses more memory than PyTorch optimizer
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+    if args.optimizer.lower() == "lion":
+        optimizer = Lion(trainable_params, lr=args.lr, weight_decay=args.weight_decay, use_triton=True)
+    elif args.optimizer.lower() == "adam":
+        optimizer = torch.optim.Adam(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+    else:
+        raise ValueError(f"Optimizer {args.optimizer} not supported")
+
     scheduler = training_utils.get_scheculer(
         optimizer=optimizer,
         scheduler_type=args.scheduler,
