@@ -462,7 +462,7 @@ def main(args):
 
     target_eval_tokens = 10_000_000
     evaluated_on_tokens = 0
-    total_loss = 0.0
+    total_loss = torch.tensor(0.0).to(device)
     with torch.no_grad():
         for batch in val_data_mapped.batch(batch_size=args.batch_size):
             if evaluated_on_tokens > target_eval_tokens:
@@ -472,12 +472,12 @@ def main(args):
             labels = batch["input_ids"].clone()
             labels[labels == pad_idx] = -100
             loss = model_engine(**batch, labels=labels).loss
-            total_loss += loss.item()
+            total_loss += loss.detach()
 
             evaluated_on_tokens += (batch["input_ids"] != pad_idx).sum().item() * world_size
 
     # gather across all GPUs
-    gathered_losses = [torch.zeros_like(torch.tensor(total_loss)) for _ in range(world_size)]
+    gathered_losses = [torch.zeros_like(total_loss) for _ in range(world_size)]
     torch.distributed.all_gather(gathered_losses, total_loss)
     total_loss = sum([t.item() for t in gathered_losses]) / world_size
 
