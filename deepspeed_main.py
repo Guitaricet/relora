@@ -1,11 +1,13 @@
 import os
 import time
+import json
 import argparse
 from datetime import datetime
 from typing import Union
 from pprint import pformat
 
 import torch
+import torch.nn as nn
 import torch.distributed
 
 import transformers
@@ -39,6 +41,7 @@ def parse_args(args):
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--model_config", type=str, required=True)
+    parser.add_argument("--continue_from", type=str, default=None)
 
     parser.add_argument("--batch_size", type=int, required=True)
     parser.add_argument("--gradient_accumulation", type=int, default=None)
@@ -109,6 +112,9 @@ def parse_args(args):
     if args.max_train_tokens is not None:
         args.num_training_steps = args.max_train_tokens // args.total_batch_size
         logger.info(f"Training for {args.num_training_steps} update steps")
+    
+    if args.continue_from is not None:
+        assert os.path.exists(args.continue_from), f"--continue_from={args.continue_from} does not exist"
 
     return args
 
@@ -185,9 +191,33 @@ def main(args):
     data_mapped.batch = lambda batch_size: training_utils.batch_fn(data_mapped, batch_size)
 
     model_config = AutoConfig.from_pretrained(args.model_config)
-    model: LlamaForCausalLM = AutoModelForCausalLM.from_config(model_config)
+    model: Union[LlamaForCausalLM, nn.Module] = AutoModelForCausalLM.from_config(model_config)
     if args.activation_checkpointing:
         model.gradient_checkpointing_enable()
+
+    global_step = 0
+    update_step = 0
+    tokens_seen = 0
+    tokens_seen_before = 0
+
+    if args.continue_from is not None:
+        logger.info("*" * 40)
+        logger.info(f"Loading model from {args.continue_from}")
+        checkpoint_path = os.path.join(args.continue_from, "pytorch_model.bin")
+        model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"), strict=True)
+
+        if os.path.exists(os.path.join(args.continue_from, "training_state.json")):
+            logger.info(f"Loading training state like global_step, update_step, and tokens_seen from {args.continue_from}")
+            with open(os.path.join(args.continue_from, "training_state.json")) as f:
+                _old_state = json.load(f)
+            global_step = _old_state["global_step"]
+            update_step = _old_state["update_step"]
+            tokens_seen = _old_state["tokens_seen"]
+            tokens_seen_before = _old_state["tokens_seen_before"]
+            logger.info(f"Will train for {args.num_training_steps} update steps")
+        else:
+            logger.warning(f"Did not find training state in {args.continue_from}, global step will start from zero")
+        logger.info("*" * 40)
 
     params_before = sum(p.numel() for p in model.parameters())
     trainable_before = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -322,10 +352,7 @@ def main(args):
     )
     model_engine: Union[ReLoRaModel, deepspeed.DeepSpeedEngine, LlamaForCausalLM]  # help with type checking
 
-    global_step = 0
-    update_step = 0
-    tokens_seen = 0
-    tokens_seen_before = 0
+    # global steps and others are defined above
     n_lora_restarts = 0
     pad_idx = tokenizer.pad_token_id
     update_time = time.time()
@@ -334,7 +361,7 @@ def main(args):
     for batch in data_mapped.batch(batch_size=args.batch_size):
         global_step += 1
         if global_rank == 0: pbar.update(1)
-        if global_step > args.num_training_steps * args.gradient_accumulation:
+        if update_step > args.num_training_steps:
             logger.info(f"Reached max number of update steps (f{args.num_training_steps}). Stopping training.")
             print(f"Rank {global_rank} stopping training.")
             break
@@ -364,6 +391,18 @@ def main(args):
 
             # I think it should save both model and optimizer this way
             model_engine.save_checkpoint(f"{current_model_directory}/deepspeed_checkpoint")
+
+            training_state_checkpoint = {
+                "global_step": global_step,
+                "update_step": update_step,
+                "tokens_seen": tokens_seen,
+                "tokens_seen_before": tokens_seen_before,
+                "n_lora_restarts": n_lora_restarts,
+                "update_time": update_time,
+            }
+            if global_rank == 0:
+                with open(f"{current_model_directory}/training_state.json", "w") as f:
+                    json.dump(training_state_checkpoint, f, indent=4)
 
         # restart model after we modify the learning rate, so on the next step after the relora frequency
         if args.relora and update_step > args.relora and update_step % args.relora == 1:
