@@ -215,6 +215,7 @@ def main(args):
         logger.info(f"Loading model from {args.continue_from}")
         checkpoint_path = os.path.join(args.continue_from, "pytorch_model.bin")
         model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"), strict=True)
+        logger.info(f"Model successfully loaded (strict=True policy)")
 
         if os.path.exists(os.path.join(args.continue_from, "training_state.json")):
             logger.info(f"Loading training state like global_step, update_step, and tokens_seen from {args.continue_from}")
@@ -236,13 +237,17 @@ def main(args):
         for p in model.parameters():
             p.requires_grad = False
 
+        keep_original = args.relora is not None or args.force_keep_original
+        if args.continue_from is not None:
+            keep_original = True
+
         model = ReLoRaModel(
             model,
             r=args.lora_r,
             lora_alpha=32,
             lora_dropout=0.1,
             target_modules=["attn", "mlp"],
-            keep_original=args.relora is not None or args.force_keep_original,
+            keep_original=keep_original,
         )
 
         for name, param in model.named_parameters():
@@ -326,7 +331,7 @@ def main(args):
         deepspeed_config["bf16"] = {"enabled": True}
     elif args.dtype in ["fp16", "float16"]:
         deepspeed_config["fp16"] = DEFAULT_FP16_CONFIG
-    
+
     _config["deepspeed_config"] = deepspeed_config
     logger.info("DeepSpeed config:")
     logger.info(pformat(deepspeed_config))
