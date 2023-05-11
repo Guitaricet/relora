@@ -224,7 +224,7 @@ def main(args):
             update_step = _old_state["update_step"]
             tokens_seen = _old_state["tokens_seen"]
             tokens_seen_before = _old_state["tokens_seen_before"]
-            logger.info(f"Will train for {args.num_training_steps} update steps")
+            logger.info(f"Will train for {args.num_training_steps - update_step} update steps")
         else:
             logger.warning(f"Did not find training state in {args.continue_from}, global step will start from zero")
         logger.info("*" * 40)
@@ -333,7 +333,7 @@ def main(args):
     if global_rank == 0:
         wandb.init(project="peft_pretraining", config=_config, tags=args.tags)
         wandb.save(os.path.abspath(__file__), policy="now") # save current script
-        pbar = tqdm(total=args.num_training_steps * args.gradient_accumulation)
+        pbar = tqdm(total=args.num_training_steps * args.gradient_accumulation - update_step)
 
     # DeepSpeed optimizer uses more memory than PyTorch optimizer
     if args.optimizer.lower() == "lion":
@@ -366,10 +366,13 @@ def main(args):
     n_lora_restarts = 0
     pad_idx = tokenizer.pad_token_id
     update_time = time.time()
+    local_step = 0  # when continue_from is used, local_step != global_step
 
     # we'll never go through all the data, so no need for epochs
     for batch in data_mapped.batch(batch_size=args.batch_size):
         global_step += 1
+        local_step += 1
+
         if global_rank == 0: pbar.update(1)
         if update_step > args.num_training_steps:
             logger.info(f"Reached max number of update steps (f{args.num_training_steps}). Stopping training.")
@@ -384,6 +387,11 @@ def main(args):
         loss = model_engine(**batch, labels=labels).loss
         model_engine.backward(loss)
         model_engine.step()  # deepspeed handles gradient accumulation
+
+        if local_step < 10 and global_rank == 0:
+            # kind of logging this out of desperation
+            logger.info(f"Loss at step {local_step}: {loss.item()}")
+            wandb.log({"loss": loss.item(), "lr": lr}, step=global_step)
 
         if not model_engine.is_gradient_accumulation_boundary():
             continue
