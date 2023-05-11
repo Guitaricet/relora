@@ -366,12 +366,12 @@ def main(args):
             model_engine.save_checkpoint(f"{current_model_directory}/deepspeed_checkpoint")
 
         # restart model after we modify the learning rate, so on the next step after the relora frequency
-        if args.relora and update_step % args.relora == 1:
+        if args.relora and update_step > args.relora and update_step % args.relora == 1:
             logger.info(f"Performing lora reset. Current lr is {optimizer.param_groups[0]['lr']}")
             n_lora_restarts += 1
             model_engine.module.merge_and_reinit()
 
-        if args.relora and update_step % args.relora == 2:
+        if args.relora and update_step > args.relora and update_step % args.relora == 2:
             logger.info(f"First step after lora reset lr is {optimizer.param_groups[0]['lr']}")
 
         lr = optimizer.param_groups[0]["lr"]
