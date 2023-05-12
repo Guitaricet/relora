@@ -471,7 +471,7 @@ def main(args):
                 },
                 step=global_step,
             )
-            if args.trainable_scaling:
+            if args.train_scaling:
                 all_scaling_factors = []
                 for module in model.modules():
                     if isinstance(module, ReLoRaLinear):
