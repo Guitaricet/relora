@@ -26,7 +26,7 @@ from tqdm import tqdm
 from loguru import logger
 
 import peft_pretraining.training_utils as training_utils
-from peft_pretraining.relora import ReLoRaModel
+from peft_pretraining.relora import ReLoRaModel, ReLoRaLinear
 
 
 # Use bfloat16 instead of fp16 if possible
@@ -471,6 +471,12 @@ def main(args):
                 },
                 step=global_step,
             )
+            if args.trainable_scaling:
+                all_scaling_factors = []
+                for module in model.modules():
+                    if isinstance(module, ReLoRaLinear):
+                        all_scaling_factors.append(module.scaling_factor.data.item())
+                wandb.log({"scaling_factors": all_scaling_factors}, step=global_step)
         update_time = time.time()
 
     logger.info("Training finished. Saving final model and optimizer state.")
