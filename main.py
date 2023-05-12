@@ -40,6 +40,7 @@ def parse_args(args):
     parser.add_argument("--use_peft", action="store_true")
     parser.add_argument("--lora_r", type=int, default=128)
     parser.add_argument("--relora", type=int, default=None)
+    parser.add_argument("--train_scaling", default=False, action="store_true")
     parser.add_argument("--reset_optimizer_on_relora", default=True, type=lambda x: x.lower() == "true")
 
     parser.add_argument("--force_keep_original", default=False, action="store_true",
@@ -199,6 +200,7 @@ def main(args):
             lora_alpha=32,
             lora_dropout=0.1,
             target_modules=["attn", "mlp"],
+            trainable_scaling=args.train_scaling,
             keep_original_weights=args.continue_from is not None,
             lora_only=not need_linear_weight,
         )

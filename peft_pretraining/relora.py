@@ -19,10 +19,11 @@ class ReLoRaConfig:
     target_modules: List[str]
     keep_original_weights: bool
     lora_only: bool = False
+    trainable_scaling: bool = False
 
 
 class ReLoRaModel(torch.nn.Module):
-    def __init__(self, model, r, lora_alpha, lora_dropout, target_modules, keep_original_weights=True, lora_only=False):
+    def __init__(self, model, r, lora_alpha, lora_dropout, target_modules, keep_original_weights=True, lora_only=False, trainable_scaling=False):
         if r <= 0:
             raise ValueError("r must be positive. If you want r == 0, use the original model.")
 
@@ -34,6 +35,7 @@ class ReLoRaModel(torch.nn.Module):
         self.target_modules = target_modules
         self.keep_original_weights = keep_original_weights
         self.lora_only = lora_only
+        self.trainable_scaling = trainable_scaling
 
         self._config = ReLoRaConfig(
             r=r,
@@ -65,11 +67,16 @@ class ReLoRaModel(torch.nn.Module):
                 lora_alpha=self.lora_alpha,
                 lora_dropout=self.lora_dropout,
                 lora_only=self.lora_only,
+                trainable_scaling=self.trainable_scaling,
             )
             if self.keep_original_weights:
                 new_module.weight = module.weight
                 if module.bias is not None:
                     new_module.bias = module.bias
+
+            if self.lora_only:
+                assert not self.keep_original_weights
+                module.weight = None
 
             parent = self._get_parent(module_name)
             module_suffix = module_name.split(".")[-1]
@@ -99,6 +106,15 @@ class ReLoRaModel(torch.nn.Module):
         config = AutoConfig.from_pretrained(path)
 
         base_model = AutoModelForCausalLM.from_config(config)
+        if "keep_original" in relora_config:
+            print("WARNING: keep_original is deprecated. Use lora_only instead.")
+            print(f"keep_original: {relora_config['keep_original']}")
+            relora_config["lora_only"] = not relora_config.pop("keep_original")
+            relora_config["keep_original_weights"] = not relora_config["lora_only"]
+
+        if "trainable_scaling" not in relora_config:
+            relora_config["trainable_scaling"] = False
+
         model = cls(base_model, **relora_config)
 
         with open(os.path.join(path, "pytorch_model.bin"), "rb") as f:
@@ -118,6 +134,7 @@ class ReLoRaLinear(nn.Linear):
         lora_alpha: int = 1,
         lora_dropout: float = 0.1,
         lora_only: bool = False,
+        trainable_scaling: bool = False,
         **kwargs,
     ):
         """Wraps linear layer x W into x W + x W_a @ W_b * lora_alpha / r
@@ -145,7 +162,11 @@ class ReLoRaLinear(nn.Linear):
         if r > 0:
             self.lora_A = nn.Linear(in_features, r, bias=False)
             self.lora_B = nn.Linear(r, out_features, bias=False)
-            self.scaling = self.lora_alpha / self.r
+            if trainable_scaling:
+                self.scaling = nn.Parameter(torch.zeros(1), requires_grad=True)
+            else:
+                self.scaling = self.lora_alpha / self.r
+
             # Freezing the pre-trained weight matrix
             if not self.lora_only:
                 self.weight.requires_grad = False
@@ -175,7 +196,11 @@ class ReLoRaLinear(nn.Linear):
         self.weight.data += self.lora_B.weight @ self.lora_A.weight * self.scaling
         self.merged = False
         nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        # print("WARNING: HARD-CODED INITIALIZZATION")
+        # nn.init.uniform_(self.lora_A.weight, 1e-7)
         nn.init.zeros_(self.lora_B.weight)
+        if self.trainable_scaling:
+            nn.init.zeros_(self.scaling)
 
     def forward(self, x: torch.Tensor):
         if self.lora_only:
