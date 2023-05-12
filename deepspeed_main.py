@@ -242,9 +242,9 @@ def main(args):
         for p in model.parameters():
             p.requires_grad = False
 
-        keep_original = args.relora is not None or args.force_keep_original
+        need_linear_weight = args.relora is not None or args.force_keep_original
         if args.continue_from is not None:
-            keep_original = True
+            need_linear_weight = True
 
         model = ReLoRaModel(
             model,
@@ -252,7 +252,8 @@ def main(args):
             lora_alpha=32,
             lora_dropout=0.1,
             target_modules=["attn", "mlp"],
-            keep_original=keep_original,
+            keep_original_weights=args.continue_from is not None,
+            lora_only=not need_linear_weight,
         )
 
         for name, param in model.named_parameters():

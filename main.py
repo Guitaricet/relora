@@ -189,9 +189,9 @@ def main(args):
         for p in model.parameters():
             p.requires_grad = False
 
-        keep_original = args.relora is not None or args.force_keep_original
+        need_linear_weight = args.relora is not None or args.force_keep_original
         if args.continue_from is not None:
-            keep_original = True
+            need_linear_weight = True
 
         model = ReLoRaModel(
             model,
@@ -199,7 +199,8 @@ def main(args):
             lora_alpha=32,
             lora_dropout=0.1,
             target_modules=["attn", "mlp"],
-            keep_original=keep_original,
+            keep_original_weights=args.continue_from is not None,
+            lora_only=not need_linear_weight,
         )
 
         for name, param in model.named_parameters():
@@ -303,7 +304,7 @@ def main(args):
         tokens_seen += (batch["input_ids"] != pad_idx).sum().item()
 
         loss = model(**batch, labels=labels).loss
-        scaled_loss =  loss/ args.gradient_accumulation
+        scaled_loss =  loss / args.gradient_accumulation
         scaled_loss.backward()
 
         if local_step < 10:
@@ -352,6 +353,14 @@ def main(args):
 
         # restart model after we modify the learning rate, so on the next step after the relora frequency
         if args.relora and update_step > args.relora and update_step % args.relora == 1:
+            copy_of_opt_state = list(optimizer.state.values())[1]["exp_avg"].clone()
+
+            if not args.reset_optimizer_on_relora:
+                logger.info("Saving optimizer states")
+                tmp_optimizer_path = os.path.join(args.save_dir, "tmp_optimizer", "optimizer.pt")
+                os.makedirs(os.path.dirname(tmp_optimizer_path), exist_ok=True)
+                torch.save(optimizer.state_dict(), tmp_optimizer_path)
+
             logger.info(f"Performing lora reset. Current lr is {optimizer.param_groups[0]['lr']}")
             n_lora_restarts += 1
             model.merge_and_reinit()
@@ -363,6 +372,11 @@ def main(args):
                         param_state = optimizer.state[p]
                         param_state["exp_avg"] = torch.zeros_like(p.data)
                         param_state["exp_avg_sq"] = torch.zeros_like(p.data)
+            else:
+                assert torch.all(copy_of_opt_state == list(optimizer.state.values())[1]["exp_avg"]), "Optimizer states are not the same after lora reset"
+                logger.info("Loading optimizer states")
+                optimizer.load_state_dict(torch.load(tmp_optimizer_path))
+                assert torch.all(copy_of_opt_state == list(optimizer.state.values())[1]["exp_avg"]), "Optimizer states are not the same after loading"
 
         if args.relora and update_step > args.relora and update_step % args.relora == 2:
             logger.info(f"First step after lora reset lr is {optimizer.param_groups[0]['lr']}")
