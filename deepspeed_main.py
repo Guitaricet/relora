@@ -471,7 +471,6 @@ def main(args):
             )
         update_time = time.time()
 
-    pbar.close()
     logger.info("Training finished. Saving final model and optimizer state.")
     logger.info(f"Saving model and optimizer at update step {update_step}")
     current_model_directory = f"{args.save_dir}/model_{update_step}"
