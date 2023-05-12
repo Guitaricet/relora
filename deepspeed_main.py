@@ -54,6 +54,7 @@ def parse_args(args):
     parser.add_argument("--use_peft", action="store_true")
     parser.add_argument("--lora_r", type=int, default=128)
     parser.add_argument("--relora", type=int, default=None)
+    parser.add_argument("--reset_optimizer_on_relora", default=True, type=lambda x: x.lower() == "true")
     parser.add_argument("--force_keep_original", default=False, action="store_true",
                         help=("Keep original model parameters even if relora is None. "
                               "Useful for making sure that full-LoRa model is equivalent to model+LoRa."))
@@ -94,6 +95,9 @@ def parse_args(args):
         # use checkpoints / model name, date and time as save directory
         args.save_dir = f"checkpoints/{args.model_config.split('/')[-1].rstrip('.json')}-{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}"
 
+    if args.tags is not None:
+        args.tags = args.tags.split(",")
+
     if not args.use_peft:
         # just for more clear hparam logging to wandb
         args.relora = None
@@ -104,9 +108,6 @@ def parse_args(args):
         logger.error("Model saving is not impelmented for DeepSpeed ZeRo Stage 3")
         raise NotImplementedError("Model saving is not impelmented for DeepSpeed ZeRo Stage 3")
 
-    if args.tags is not None:
-        args.tags = args.tags.split(",")
-
     if args.total_batch_size is None:
         args.gradient_accumulation = args.gradient_accumulation or 1
         args.total_batch_size = args.batch_size * args.gradient_accumulation
@@ -116,7 +117,7 @@ def parse_args(args):
     if args.max_train_tokens is not None:
         args.num_training_steps = args.max_train_tokens // args.total_batch_size
         logger.info(f"Training for {args.num_training_steps} update steps")
-    
+
     if args.continue_from is not None:
         assert os.path.exists(args.continue_from), f"--continue_from={args.continue_from} does not exist"
 
@@ -225,6 +226,10 @@ def main(args):
             update_step = _old_state["update_step"]
             tokens_seen = _old_state["tokens_seen"]
             tokens_seen_before = _old_state["tokens_seen_before"]
+            logger.info(f"global_step       : {global_step}")
+            logger.info(f"update_step       : {update_step}")
+            logger.info(f"tokens_seen       : {tokens_seen}")
+            logger.info(f"tokens_seen_before: {tokens_seen_before}")
             logger.info(f"Will train for {args.num_training_steps - update_step} update steps")
         else:
             logger.warning(f"Did not find training state in {args.continue_from}, global step will start from zero")
@@ -434,6 +439,14 @@ def main(args):
             n_lora_restarts += 1
             model_engine.module.merge_and_reinit()
 
+            if args.reset_optimizer_on_relora:
+                logger.info("Resetting optimizer states to zeros")
+                for group in optimizer.param_groups:
+                    for p in group["params"]:
+                        param_state = optimizer.state[p]
+                        param_state["exp_avg"] = torch.zeros_like(p.data)
+                        param_state["exp_avg_sq"] = torch.zeros_like(p.data)
+
         if args.relora and update_step > args.relora and update_step % args.relora == 2:
             logger.info(f"First step after lora reset lr is {optimizer.param_groups[0]['lr']}")
 
@@ -457,6 +470,7 @@ def main(args):
             )
         update_time = time.time()
 
+    pbar.close()
     logger.info("Training finished. Saving final model and optimizer state.")
     logger.info(f"Saving model and optimizer at update step {update_step}")
     current_model_directory = f"{args.save_dir}/model_{update_step}"
