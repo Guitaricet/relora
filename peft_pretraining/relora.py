@@ -158,6 +158,7 @@ class ReLoRaLinear(nn.Linear):
         self.lora_alpha = lora_alpha
         self.lora_dropout = nn.Dropout(p=lora_dropout)
         self.lora_only = lora_only
+        self.trainable_scaling = trainable_scaling
 
         if r > 0:
             self.lora_A = nn.Linear(in_features, r, bias=False)
