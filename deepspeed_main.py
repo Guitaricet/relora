@@ -476,7 +476,7 @@ def main(args):
                 for module in model.modules():
                     if isinstance(module, ReLoRaLinear):
                         all_scaling_factors.append(module.scaling.data.item())
-                wandb.log({"lora_scaling": all_scaling_factors}, step=global_step)
+                wandb.log({"lora_scaling": torch.tensor(all_scaling_factors)}, step=global_step)
         update_time = time.time()
 
     logger.info("Training finished. Saving final model and optimizer state.")
