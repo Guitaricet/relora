@@ -292,6 +292,34 @@ def main(args):
         if (trainable_after >= trainable_before):
             raise ValueError("Total number of trainable parameters should decrease after applying LoRA with restarts")
 
+    # Initialize DeepSpeed
+    # Prefer to make config here instead of a file to reduce the number of files
+    # Reproducibility is enabled through WandB
+    deepspeed_config = {
+        "train_micro_batch_size_per_gpu": args.batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation,
+        "zero_optimization": {
+            "stage": args.stage,
+        }
+    }
+    if args.dtype == "bfloat16":
+        deepspeed_config["bf16"] = {"enabled": True}
+    elif args.dtype in ["fp16", "float16"]:
+        deepspeed_config["fp16"] = DEFAULT_FP16_CONFIG
+
+    _config["deepspeed_config"] = deepspeed_config
+    logger.info("DeepSpeed config:")
+    logger.info(pformat(deepspeed_config))
+    model, optimizer, _, _ = deepspeed.initialize(
+        args=args,
+        model=model,
+        model_parameters=trainable_params,
+        optimizer=optimizer,
+        lr_scheduler=scheduler,
+        config_params=deepspeed_config,
+    )
+    model: Union[ReLoRaModel, deepspeed.DeepSpeedEngine, LlamaForCausalLM]  # help with type checking
+
     n_total_params = sum(p.numel() for p in model.parameters())
     n_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     p_trainable_params = n_trainable_params / n_total_params
@@ -323,26 +351,6 @@ def main(args):
             "target_modules": ["attn", "mlp"],
         }
 
-    # Initialize DeepSpeed
-    # Prefer to make config here instead of a file to reduce the number of files
-    # Reproducibility is enabled through WandB
-    logger.info(args)
-    logger.info(args.lr)
-    deepspeed_config = {
-        "train_micro_batch_size_per_gpu": args.batch_size,
-        "gradient_accumulation_steps": args.gradient_accumulation,
-        "zero_optimization": {
-            "stage": args.stage,
-        }
-    }
-    if args.dtype == "bfloat16":
-        deepspeed_config["bf16"] = {"enabled": True}
-    elif args.dtype in ["fp16", "float16"]:
-        deepspeed_config["fp16"] = DEFAULT_FP16_CONFIG
-
-    _config["deepspeed_config"] = deepspeed_config
-    logger.info("DeepSpeed config:")
-    logger.info(pformat(deepspeed_config))
     if global_rank == 0:
         wandb.init(project="peft_pretraining", config=_config, tags=args.tags)
         wandb.save(os.path.abspath(__file__), policy="now") # save current script
@@ -364,16 +372,6 @@ def main(args):
         min_lr_ratio=args.min_lr_ratio,
         cycle_length=args.cycle_length,
     )
-
-    model_engine, optimizer, _, _ = deepspeed.initialize(
-        args=args,
-        model=model,
-        model_parameters=trainable_params,
-        optimizer=optimizer,
-        lr_scheduler=scheduler,
-        config_params=deepspeed_config,
-    )
-    model_engine: Union[ReLoRaModel, deepspeed.DeepSpeedEngine, LlamaForCausalLM]  # help with type checking
 
     # global steps and others are defined above
     n_lora_restarts = 0
@@ -397,9 +395,9 @@ def main(args):
         labels[labels == pad_idx] = -100
         tokens_seen += (batch["input_ids"] != pad_idx).sum().item() * world_size
 
-        loss = model_engine(**batch, labels=labels).loss
-        model_engine.backward(loss)
-        model_engine.step()  # deepspeed handles gradient accumulation
+        loss = model(**batch, labels=labels).loss
+        model.backward(loss)
+        model.step()  # deepspeed handles gradient accumulation
 
         if local_step < 10 and global_rank == 0:
             # kind of logging this out of desperation
@@ -407,7 +405,7 @@ def main(args):
             lr = optimizer.param_groups[0]["lr"]
             wandb.log({"loss": loss.item(), "lr": lr}, step=global_step)
 
-        if not model_engine.is_gradient_accumulation_boundary():
+        if not model.is_gradient_accumulation_boundary():
             continue
 
         # The below code is only executed during the update step
@@ -419,10 +417,10 @@ def main(args):
             os.makedirs(args.save_dir, exist_ok=True)
             current_model_directory = f"{args.save_dir}/model_{update_step}"
             if global_rank == 0:
-                model.save_pretrained(current_model_directory)  # won't work with Stage 3
+                model.module.save_pretrained(current_model_directory)  # won't work with Stage 3
 
             # I think it should save both model and optimizer this way
-            model_engine.save_checkpoint(f"{current_model_directory}/deepspeed_checkpoint")
+            model.save_checkpoint(f"{current_model_directory}/deepspeed_checkpoint")
 
             training_state_checkpoint = {
                 "global_step": global_step,
@@ -440,7 +438,7 @@ def main(args):
         if args.relora and update_step > args.relora and update_step % args.relora == 1:
             logger.info(f"Performing lora reset. Current lr is {optimizer.param_groups[0]['lr']}")
             n_lora_restarts += 1
-            model_engine.module.merge_and_reinit()
+            model.module.merge_and_reinit()
 
             if args.reset_optimizer_on_relora:
                 logger.info("Resetting optimizer states to zeros")
@@ -485,13 +483,13 @@ def main(args):
     if global_rank == 0:
         pbar.close()
         os.makedirs(args.save_dir, exist_ok=True)
-        model.save_pretrained(current_model_directory)  # won't work with Stage 3
+        model.module.save_pretrained(current_model_directory)  # won't work with Stage 3
 
-    model_engine.save_checkpoint(f"{current_model_directory}/deepspeed_checkpoint")
+    model.save_checkpoint(f"{current_model_directory}/deepspeed_checkpoint")
 
     # Final evaluation
     logger.info("Running final evaluation")
-    model_engine.eval()
+    model.eval()
     del loss, optimizer, scheduler
     import gc; gc.collect()
     torch.cuda.empty_cache()
@@ -519,7 +517,7 @@ def main(args):
             batch = {k: v.to(device) for k, v in batch.items()}
             labels = batch["input_ids"].clone()
             labels[labels == pad_idx] = -100
-            loss = model_engine(**batch, labels=labels).loss
+            loss = model(**batch, labels=labels).loss
             total_loss += loss.detach()
 
             evaluated_on_tokens += (batch["input_ids"] != pad_idx).sum().item() * world_size
