@@ -164,7 +164,7 @@ class ReLoRaLinear(nn.Linear):
             self.lora_A = nn.Linear(in_features, r, bias=False)
             self.lora_B = nn.Linear(r, out_features, bias=False)
             if trainable_scaling:
-                self.scaling = nn.Parameter(torch.tensor(0.1), requires_grad=True)
+                self.scaling = nn.Parameter(torch.tensor([0.]), requires_grad=True)
             else:
                 self.scaling = self.lora_alpha / self.r
 
@@ -187,6 +187,12 @@ class ReLoRaLinear(nn.Linear):
         # disgard original, but now we need to init both A and B with kaiming
         nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
         nn.init.kaiming_uniform_(self.lora_B.weight, a=math.sqrt(5))
+    
+    def _post_lora_scale(self):
+        if self.trainable_scaling:
+            return self.scaling.tanh()
+
+        return self.scaling
 
     @torch.no_grad()
     def merge_and_reinit(self):
@@ -194,7 +200,7 @@ class ReLoRaLinear(nn.Linear):
             print("WARNING: Skipping merge and reinit, because only lora parameters are used")
             return
 
-        self.weight.data += self.lora_B.weight @ self.lora_A.weight * self.scaling
+        self.weight.data += self.lora_B.weight @ self.lora_A.weight * self._post_lora_scale()
         self.merged = False
         nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
         # print("WARNING: HARD-CODED INITIALIZZATION")
@@ -206,10 +212,10 @@ class ReLoRaLinear(nn.Linear):
     def forward(self, x: torch.Tensor):
         if self.lora_only:
             # just lora
-            return self.lora_B(self.lora_A(self.lora_dropout(x))) * self.scaling
+            return self.lora_B(self.lora_A(self.lora_dropout(x))) * self._post_lora_scale()
 
         result = F.linear(x, self.weight, bias=self.bias)
 
         if self.r > 0:
-            result += self.lora_B(self.lora_A(self.lora_dropout(x))) * self.scaling
+            result += self.lora_B(self.lora_A(self.lora_dropout(x))) * self._post_lora_scale()
         return result
