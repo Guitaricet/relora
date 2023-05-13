@@ -302,8 +302,8 @@ def main(args):
     n_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     p_trainable_params = n_trainable_params / n_total_params
 
-    trainable_params = (p for p in model.parameters() if p.requires_grad)
-    lora_params = (p for p in model.parameters() if p.requires_grad and "lora_" in p.name)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    lora_params = [p for n, p in model.named_parameters() if p.requires_grad and "lora_" in n]
     trainable_params_names = [name for name, p in model.named_parameters() if p.requires_grad]
 
     # Initialize wandb
