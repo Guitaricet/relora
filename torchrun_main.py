@@ -472,7 +472,7 @@ def main(args):
     if global_rank == 0 and not os.path.exists(current_model_directory):
         logger.info(f"Saving model and optimizer at update step {update_step}")
         os.makedirs(args.save_dir, exist_ok=True)
-        model.save_pretrained(current_model_directory)
+        model.module.save_pretrained(current_model_directory)
 
         optimizer_checkpoint = {
             "optimizer": optimizer.state_dict(),
