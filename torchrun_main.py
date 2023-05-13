@@ -279,6 +279,11 @@ def main(args):
         if (trainable_after >= trainable_before):
             raise ValueError("Total number of trainable parameters should decrease after applying LoRA with restarts")
 
+    if args.dtype in ["bf16", "bfloat16"]:
+        model = model.to(device=device, dtype=torch.bfloat16)
+    else:
+        model = model.to(device=device)
+
     model: Union[ReLoRaModel, LlamaForCausalLM] = torch.nn.parallel.DistributedDataParallel(
         model,
         device_ids=[args.local_rank],
@@ -316,13 +321,6 @@ def main(args):
             "dropout": 0.1,
             "target_modules": ["attn", "mlp"],
         }
-
-    # Initialize torch.distributed model thing
-
-    if args.dtype in ["bf16", "bfloat16"]:
-        model = model.to(device=device, dtype=torch.bfloat16)
-    else:
-        model = model.to(device=device)
 
     if global_rank == 0:
         wandb.init(project="peft_pretraining", config=_config, tags=args.tags)
