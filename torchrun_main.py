@@ -279,6 +279,13 @@ def main(args):
         if (trainable_after >= trainable_before):
             raise ValueError("Total number of trainable parameters should decrease after applying LoRA with restarts")
 
+    model: Union[ReLoRaModel, LlamaForCausalLM] = torch.nn.parallel.DistributedDataParallel(
+        model,
+        device_ids=[args.local_rank],
+        output_device=args.local_rank,
+        broadcast_buffers=False,
+    )
+
     n_total_params = sum(p.numel() for p in model.parameters())
     n_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     p_trainable_params = n_trainable_params / n_total_params
@@ -317,13 +324,6 @@ def main(args):
     else:
         model = model.to(device=device)
 
-    model = torch.nn.parallel.DistributedDataParallel(
-        model,
-        device_ids=[args.local_rank],
-        output_device=args.local_rank,
-        broadcast_buffers=False,
-    )
-
     if global_rank == 0:
         wandb.init(project="peft_pretraining", config=_config, tags=args.tags)
         wandb.save(os.path.abspath(__file__), policy="now") # save current script
@@ -343,13 +343,6 @@ def main(args):
         warmup_steps=args.warmup_steps,
         min_lr_ratio=args.min_lr_ratio,
         cycle_length=args.cycle_length,
-    )
-
-    model: Union[ReLoRaModel, LlamaForCausalLM] = torch.nn.parallel.DistributedDataParallel(
-        model,
-        device_ids=[local_rank],
-        output_device=local_rank,
-        broadcast_buffers=False,
     )
 
     # global steps and others are defined above
