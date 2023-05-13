@@ -307,7 +307,6 @@ def main(args):
     elif args.dtype in ["fp16", "float16"]:
         deepspeed_config["fp16"] = DEFAULT_FP16_CONFIG
 
-    _config["deepspeed_config"] = deepspeed_config
     logger.info("DeepSpeed config:")
     logger.info(pformat(deepspeed_config))
     model, optimizer, _, _ = deepspeed.initialize(
@@ -339,6 +338,7 @@ def main(args):
         "dataset": dataset_name,
         "model": model_config.to_dict(),
         "device": str(device),
+        "deepspeed_config": deepspeed_config,
     }
     _config.update(_config_ext)
 
