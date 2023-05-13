@@ -389,7 +389,7 @@ def main(args):
             logger.info(f"Saving model and optimizer at update step {update_step}")
             os.makedirs(args.save_dir, exist_ok=True)
             current_model_directory = f"{args.save_dir}/model_{update_step}"
-            model.save_pretrained(current_model_directory)
+            model.module.save_pretrained(current_model_directory)
 
             optimizer_checkpoint = {
                 "optimizer": optimizer.state_dict(),
