@@ -92,8 +92,9 @@ def svd_internal_dimensionality_reduction(tensor, num_components):
     """
     Performs SVD dimensionality reduction, but returns the full tensor instead of just the reduced components.
     """
-    u, s, v = torch.svd(tensor)
-    return torch.matmul(u[:, :num_components] * s[:num_components], v[:, :num_components].T)
+    original_dtype = tensor.dtype
+    u, s, v = torch.svd(tensor.to(dtype=torch.float32))
+    return torch.matmul(u[:, :num_components] * s[:num_components], v[:, :num_components].T).to(dtype=original_dtype)
 
 
 def _get_cyclical_cosine_schedule_with_min_lr_lambda(current_step, *, num_warmup_steps, cycle_length, min_lr_ratio):
