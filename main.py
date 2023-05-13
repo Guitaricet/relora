@@ -69,7 +69,6 @@ def parse_args(args):
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--seed", type=int, default=0)
 
-
     args = parser.parse_args(args)
 
     if not args.train_ln:
