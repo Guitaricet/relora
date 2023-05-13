@@ -11,19 +11,21 @@ import numpy as np
 
 import torch
 import torch.nn as nn
-
+import torch.distributed
 
 import transformers
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM, LlamaForCausalLM
+from lion_pytorch import Lion
 
 import datasets
+import datasets.distributed
 import wandb
 
 from tqdm import tqdm
 from loguru import logger
 
 import peft_pretraining.training_utils as training_utils
-from peft_pretraining.relora import ReLoRaModel
+from peft_pretraining.relora import ReLoRaModel, ReLoRaLinear
 
 
 def parse_args(args):
@@ -42,12 +44,12 @@ def parse_args(args):
     parser.add_argument("--relora", type=int, default=None)
     parser.add_argument("--train_scaling", default=False, action="store_true")
     parser.add_argument("--reset_optimizer_on_relora", default=True, type=lambda x: x.lower() == "true")
-
     parser.add_argument("--force_keep_original", default=False, action="store_true",
                         help=("Keep original model parameters even if relora is None. "
                               "Useful for making sure that full-LoRa model is equivalent to model+LoRa."))
 
     parser.add_argument("--train_ln", default=True, action="store_true")
+    parser.add_argument("--optimizer", default="Adam", choices=["Adam", "Lion"])
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--scheduler", type=str, default="cosine")
     parser.add_argument("--cycle_length", type=int, default=None, help="Number of steps per cycle for cosine scheduler")
@@ -63,16 +65,17 @@ def parse_args(args):
                         help="Number of tokens to train on. Overwrites num_training_steps. "
                              "You can use M and B suffixes, e.g. 100M or 1B.")
     parser.add_argument("--save_every", type=int, default=10_000)
-    parser.add_argument("--tags", type=str, default=None)
     parser.add_argument("--save_dir", type=str, default=None)
-    parser.add_argument("--device", type=str, default=None)
-    parser.add_argument("--dtype", type=str, default="bfloat16")
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--tags", type=str, default=None)
+    parser.add_argument("--dtype", type=str, default="bfloat16" if torch.cuda.is_bf16_supported() else "float32")
 
+    parser.add_argument("--distributed_port", type=int, default=29500)
+    parser.add_argument("--seed", type=int, default=0)
 
     args = parser.parse_args(args)
 
     if not args.train_ln:
+        logger.error("Are you sure? Not training LN is a bad idea.")
         raise ValueError("Are you sure? Not training LN is a bad idea.")
 
     if args.save_dir is None:
@@ -101,6 +104,9 @@ def parse_args(args):
     if args.continue_from is not None:
         assert os.path.exists(args.continue_from), f"--continue_from={args.continue_from} does not exist"
 
+    if args.dtype in ["fp16", "float16"]:
+        raise NotImplementedError("fp16 is not supported in torchrun_main.py. Use deepspeed_main.py instead (but it seems to have bugs)")
+
     return args
 
 
@@ -110,15 +116,36 @@ def main(args):
     np.random.seed(args.seed)
     random.seed(args.seed)
 
+    assert "LOCAL_RANK" in os.environ, "torchrun should set LOCAL_RANK"
+    args.local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(args.local_rank)
 
-    device = args.device or "cuda"
+    # assumes that we are using a single node
+    torch.distributed.init_process_group(
+        backend="nccl",
+        init_method=f"tcp://127.0.0.1:{args.distributed_port}",
+        rank=args.local_rank,
+        world_size=torch.cuda.device_count()
+    )
+
+    global_rank = torch.distributed.get_rank()
+    local_rank = global_rank % torch.cuda.device_count()
+    world_size = torch.distributed.get_world_size()
+    device = f"cuda:{local_rank}"
+
     if args.total_batch_size is not None:
         if args.gradient_accumulation is None:
-            args.gradient_accumulation = args.total_batch_size // args.batch_size
+            assert args.total_batch_size % world_size == 0, "total_batch_size must be divisible by world_size"
+            args.gradient_accumulation = args.total_batch_size // (args.batch_size * world_size)
+            assert args.gradient_accumulation > 0, "gradient_accumulation must be greater than 0"
 
-    assert args.batch_size * args.gradient_accumulation == args.total_batch_size, \
-        "batch_size * gradient_accumulation must be equal to total_batch_size"
+    assert args.gradient_accumulation * args.batch_size * world_size == args.total_batch_size, \
+        "gradient_accumulation * batch_size * world_size must be equal to total_batch_size"
 
+    # turn off logger
+    if global_rank != 0: logger.remove()
+
+    logger.info(f"Using torch.distributed with rank {global_rank} (only rank 0 will log)")
     logger.info("*" * 40)
     logger.info(f"Starting training with the arguments")
     for k, v in vars(args).items():
@@ -130,8 +157,12 @@ def main(args):
     data = datasets.load_dataset("c4", "en", split="train", streaming=True)
     val_data = datasets.load_dataset("c4", "en", split="validation", streaming=True)
 
+    # this seed is hard-coded to guarantee the same order of the examples (for any --seed)
     data: datasets.Dataset = data.shuffle(seed=42)
     val_data: datasets.Dataset = val_data.shuffle(seed=42)  # not sure if C4 val set is shuffled originally
+    data = datasets.distributed.split_dataset_by_node(
+        data, rank=global_rank, world_size=world_size,
+    )
 
     # it doesn't matter which tokenizer we use, because we train from scratch
     # T5 tokenizer was trained on C4 and we are also training on C4, so it's a good choice
@@ -256,7 +287,7 @@ def main(args):
 
     # Initialize wandb
     _config = dict(vars(args))
-    _config["max_lr"] = _config.pop("lr")  # rename lr to max_lr
+    _config["max_lr"] = _config.pop("lr")  # rename lr to max_lr to avoid conflicts with scheduler
     _config_ext = {
         "total_params_M": n_total_params / 1_000_000,
         "trainable_params_M": n_trainable_params / 1_000_000,
@@ -278,12 +309,32 @@ def main(args):
             "target_modules": ["attn", "mlp"],
         }
 
-    wandb.init(project="peft_pretraining", config=_config, tags=args.tags)
-    wandb.save(os.path.abspath(__file__), policy="now") # save current script
-    pbar = tqdm(total=args.num_training_steps * args.gradient_accumulation - update_step)
+    # Initialize torch.distributed model thing
 
-    model = model.to(device, dtype=getattr(torch, args.dtype))
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+    if args.dtype in ["bf16", "bfloat16"]:
+        model = model.to(device=device, dtype=torch.bfloat16)
+    else:
+        model = model.to(device=device)
+
+    model = torch.nn.parallel.DistributedDataParallel(
+        model,
+        device_ids=[args.local_rank],
+        output_device=args.local_rank,
+        broadcast_buffers=False,
+    )
+
+    if global_rank == 0:
+        wandb.init(project="peft_pretraining", config=_config, tags=args.tags)
+        wandb.save(os.path.abspath(__file__), policy="now") # save current script
+        pbar = tqdm(total=args.num_training_steps * args.gradient_accumulation - update_step)
+
+    if args.optimizer.lower() == "lion":
+        optimizer = Lion(trainable_params, lr=args.lr, weight_decay=args.weight_decay, use_triton=True)
+    elif args.optimizer.lower() == "adam":
+        optimizer = torch.optim.Adam(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+    else:
+        raise ValueError(f"Optimizer {args.optimizer} not supported")
+
     scheduler = training_utils.get_scheculer(
         optimizer=optimizer,
         scheduler_type=args.scheduler,
@@ -291,6 +342,13 @@ def main(args):
         warmup_steps=args.warmup_steps,
         min_lr_ratio=args.min_lr_ratio,
         cycle_length=args.cycle_length,
+    )
+
+    model: Union[ReLoRaModel, LlamaForCausalLM] = torch.nn.parallel.DistributedDataParallel(
+        model,
+        device_ids=[local_rank],
+        output_device=local_rank,
+        broadcast_buffers=False,
     )
 
     # global steps and others are defined above
@@ -303,21 +361,23 @@ def main(args):
     for batch in data_mapped.batch(batch_size=args.batch_size):
         global_step += 1
         local_step += 1
-        pbar.update(1)
+
+        if global_rank == 0: pbar.update(1)
         if update_step > args.num_training_steps:
             logger.info(f"Reached max number of update steps (f{args.num_training_steps}). Stopping training.")
+            print(f"Rank {global_rank} stopping training.")
             break
 
         batch = {k: v.to(device) for k, v in batch.items()}
         labels = batch["input_ids"].clone()
         labels[labels == pad_idx] = -100
-        tokens_seen += (batch["input_ids"] != pad_idx).sum().item()
+        tokens_seen += (batch["input_ids"] != pad_idx).sum().item() * world_size
 
         loss = model(**batch, labels=labels).loss
         scaled_loss = loss / args.gradient_accumulation
         scaled_loss.backward()
 
-        if local_step < 10:
+        if local_step < 10 and global_rank == 0:
             # kind of logging this out of desperation
             logger.info(f"Loss at step {local_step}: {loss.item()}")
             lr = optimizer.param_groups[0]["lr"]
@@ -333,11 +393,12 @@ def main(args):
         update_step += 1
         update_time = time.time() - update_time
 
-        if update_step % args.save_every == 0:
+        if update_step % args.save_every == 0 and global_rank == 0:
             logger.info(f"Saving model and optimizer at update step {update_step}")
             os.makedirs(args.save_dir, exist_ok=True)
             current_model_directory = f"{args.save_dir}/model_{update_step}"
             model.save_pretrained(current_model_directory)
+
             optimizer_checkpoint = {
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
@@ -362,14 +423,6 @@ def main(args):
 
         # restart model after we modify the learning rate, so on the next step after the relora frequency
         if args.relora and update_step > args.relora and update_step % args.relora == 1:
-            copy_of_opt_state = list(optimizer.state.values())[1]["exp_avg"].clone()
-
-            if not args.reset_optimizer_on_relora:
-                logger.info("Saving optimizer states")
-                tmp_optimizer_path = os.path.join(args.save_dir, "tmp_optimizer", "optimizer.pt")
-                os.makedirs(os.path.dirname(tmp_optimizer_path), exist_ok=True)
-                torch.save(optimizer.state_dict(), tmp_optimizer_path)
-
             logger.info(f"Performing lora reset. Current lr is {optimizer.param_groups[0]['lr']}")
             n_lora_restarts += 1
             model.merge_and_reinit()
@@ -381,50 +434,66 @@ def main(args):
                         param_state = optimizer.state[p]
                         param_state["exp_avg"] = torch.zeros_like(p.data)
                         param_state["exp_avg_sq"] = torch.zeros_like(p.data)
-            else:
-                assert torch.all(copy_of_opt_state == list(optimizer.state.values())[1]["exp_avg"]), "Optimizer states are not the same after lora reset"
-                logger.info("Loading optimizer states")
-                optimizer.load_state_dict(torch.load(tmp_optimizer_path))
-                assert torch.all(copy_of_opt_state == list(optimizer.state.values())[1]["exp_avg"]), "Optimizer states are not the same after loading"
 
         if args.relora and update_step > args.relora and update_step % args.relora == 2:
             logger.info(f"First step after lora reset lr is {optimizer.param_groups[0]['lr']}")
 
-        lr = scheduler.get_last_lr()[0]
+        lr = optimizer.param_groups[0]["lr"]
         tokens_in_update = tokens_seen - tokens_seen_before
         tokens_seen_before = tokens_seen
-        batches_in_update = args.gradient_accumulation
+        batches_in_update = args.gradient_accumulation * world_size
 
-        wandb.log({
-            "loss": loss.item(),
-            "lr": lr,
-            "update_step": update_step,
-            "tokens_seen": tokens_seen,
-            "throughput_tokens": tokens_in_update / update_time,
-            "throughput_examples": args.total_batch_size / update_time,
-            "throughput_batches": batches_in_update / update_time,
-            "n_lora_restarts": n_lora_restarts,
-            },
-            step=global_step,
-        )
+        if global_rank == 0:
+            wandb.log({
+                "loss": loss.item(),
+                "lr": lr,
+                "update_step": update_step,
+                "tokens_seen": tokens_seen,
+                "throughput_tokens": tokens_in_update / update_time,
+                "throughput_examples": args.total_batch_size / update_time,
+                "throughput_batches": batches_in_update / update_time,
+                "n_lora_restarts": n_lora_restarts,
+                },
+                step=global_step,
+            )
+            if args.train_scaling:
+                all_scaling_factors = []
+                for module in model.modules():
+                    if isinstance(module, ReLoRaLinear):
+                        all_scaling_factors.append(module.scaling.data.item())
+                wandb.log({"lora_scaling": torch.tensor(all_scaling_factors)}, step=global_step)
         update_time = time.time()
 
-    pbar.close()
-    logger.info("Training finished. Saving final model and optimizer state.")
-    logger.info(f"Saving model at update step {update_step}")
-    os.makedirs(args.save_dir, exist_ok=True)
+    logger.info("Training finished")
+    if global_rank == 0: pbar.close()
+
     current_model_directory = f"{args.save_dir}/model_{update_step}"
-    model.save_pretrained(current_model_directory)
-    optimizer_checkpoint = {
-        "optimizer": optimizer.state_dict(),
-        "scheduler": scheduler.state_dict(),
-        "update_step": update_step,
-        "global_step": global_step,
-        "config": _config,
-        "wandb": wandb.run.dir,
-        "dtype": args.dtype,
-    }
-    torch.save(optimizer_checkpoint, f"{current_model_directory}/optimizer.pt")
+    if global_rank == 0 and not os.path.exists(current_model_directory):
+        logger.info(f"Saving model and optimizer at update step {update_step}")
+        os.makedirs(args.save_dir, exist_ok=True)
+        model.save_pretrained(current_model_directory)
+
+        optimizer_checkpoint = {
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "update_step": update_step,
+            "global_step": global_step,
+            "config": _config,
+            "wandb": wandb.run.dir,
+            "dtype": args.dtype,
+        }
+        torch.save(optimizer_checkpoint, f"{current_model_directory}/optimizer.pt")
+
+        training_state_checkpoint = {
+            "global_step": global_step,
+            "update_step": update_step,
+            "tokens_seen": tokens_seen,
+            "tokens_seen_before": tokens_seen_before,
+            "n_lora_restarts": n_lora_restarts,
+            "update_time": update_time,
+        }
+        with open(f"{current_model_directory}/training_state.json", "w") as f:
+            json.dump(training_state_checkpoint, f, indent=4)
 
     # Final evaluation
     logger.info("Running final evaluation")
@@ -433,6 +502,9 @@ def main(args):
     import gc; gc.collect()
     torch.cuda.empty_cache()
 
+    val_data = datasets.distributed.split_dataset_by_node(
+        val_data, rank=global_rank, world_size=world_size,
+    )
     val_data_mapped = val_data.map(
         preprocess_batched,
         batched=True,
@@ -456,20 +528,26 @@ def main(args):
             loss = model(**batch, labels=labels).loss
             total_loss += loss.detach()
 
-            evaluated_on_tokens += (batch["input_ids"] != pad_idx).sum().item()
+            evaluated_on_tokens += (batch["input_ids"] != pad_idx).sum().item() * world_size
 
     total_loss = total_loss / total_batches
 
-    wandb.log({
-        "final_eval_loss": total_loss,
-        "final_eval_tokens": evaluated_on_tokens,
-        },
-        step=global_step,
-    )
-    logger.info(f"Final eval loss: {total_loss}")
+    # gather across all GPUs
+    gathered_losses = [torch.zeros_like(total_loss) for _ in range(world_size)]
+    torch.distributed.all_gather(gathered_losses, total_loss)
+    total_loss = sum([t.item() for t in gathered_losses]) / world_size
+
+    if global_rank == 0:
+        wandb.log({
+            "final_eval_loss": total_loss,
+            "final_eval_tokens": evaluated_on_tokens,
+            },
+            step=global_step,
+        )
+        logger.info(f"Final eval loss: {total_loss}")
 
     logger.info("Script finished successfully")
-    logger.info(f"Final model checkpoint: {current_model_directory}")
+    print(f"Rank {global_rank} finished successfully")
 
 
 if __name__ == "__main__":
