@@ -135,7 +135,7 @@ def _get_cosine_schedule_with_multiple_warmups_lambda(
     if restart_step < restart_warmup_steps:
         # get expected lr multipler at the end of the warmup
         end_of_warmup_progress = (
-            float((restart_number) * restart_every - first_warmup_steps) /
+            float(restart_number * restart_every) /
             float(max(1, num_training_steps - first_warmup_steps))
         )
 
