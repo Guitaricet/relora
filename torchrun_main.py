@@ -55,8 +55,9 @@ def parse_args(args):
     parser.add_argument("--train_ln", default=True, action="store_true")
     parser.add_argument("--optimizer", default="Adam", choices=["Adam", "Lion"])
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--scheduler", type=str, default="cosine")
+    parser.add_argument("--scheduler", type=str, default="cosine", choices=["linear", "cosine", "cosine_restarts"])
     parser.add_argument("--cycle_length", type=int, default=None, help="Number of steps per cycle for cosine scheduler")
+    parser.add_argument("--restart_warmup_steps", type=int, default=None, help="Number of steps for cosine restarts (only used for cosine_restarts)")
     parser.add_argument("--min_lr_ratio", type=float, default=0.1)
     parser.add_argument("--activation_checkpointing", action="store_true")
     parser.add_argument("--weight_decay", type=float, default=0.0)
@@ -349,6 +350,7 @@ def main(args):
         warmup_steps=args.warmup_steps,
         min_lr_ratio=args.min_lr_ratio,
         cycle_length=args.cycle_length,
+        restart_warmup_steps=args.restart_warmup_steps,
     )
 
     # global steps and others are defined above
