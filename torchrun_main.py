@@ -406,8 +406,9 @@ def main(args):
                 logger.info("Performing SVD on optimizer states (going to take some time)")
                 for p in tqdm(lora_params, desc="SVDing optimizer states"):
                     param_state = optimizer.state[p]
-                    param_state["exp_avg"] = training_utils.svd_internal_dimensionality_reduction(param_state["exp_avg"])
-                    param_state["exp_avg_sq"] = training_utils.svd_internal_dimensionality_reduction(param_state["exp_avg_sq"])
+                    svd = training_utils.svd_internal_dimensionality_reduction
+                    param_state["exp_avg"] = svd(param_state["exp_avg"], num_components=args.svd_optimizer_on_relora)
+                    param_state["exp_avg_sq"] = svd(param_state["exp_avg_sq"], num_components=args.svd_optimizer_on_relora)
 
             if args.keep_first_opt_rows:
                 # a.k.a "simple dimensionality reduction"
