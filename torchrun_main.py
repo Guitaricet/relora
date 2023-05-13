@@ -119,7 +119,9 @@ def main(args):
     assert "LOCAL_RANK" in os.environ, "torchrun should set LOCAL_RANK"
     args.local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(args.local_rank)
+    print(f"local rank: {args.local_rank}, device: {torch.cuda.current_device()}")
 
+    print(f"Initializing distributed training with {torch.cuda.device_count()} GPUs")
     # assumes that we are using a single node
     torch.distributed.init_process_group(
         backend="nccl",
@@ -127,6 +129,10 @@ def main(args):
         rank=args.local_rank,
         world_size=torch.cuda.device_count()
     )
+    print(f"Initialized distributed training. Only rank 0 GPU will log now")
+
+    if global_rank == 0:
+        print("I am rank 0!")
 
     global_rank = torch.distributed.get_rank()
     local_rank = global_rank % torch.cuda.device_count()
@@ -551,5 +557,6 @@ def main(args):
 
 
 if __name__ == "__main__":
+    print("Starting script")
     args = parse_args(None)
     main(args)
