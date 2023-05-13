@@ -40,7 +40,7 @@ def check_args_torchrun_main(args):
     if int(args.reset_optimizer_on_relora) + int(bool(args.svd_optimizer_on_relora)) + int(bool(args.keep_first_opt_rows)) > 1:
         raise ValueError("reset_optimizer_on_relora, svd_optimizer_on_relora, and keep_first_opt_rows are mutually exclusive")
 
-    if args.relora and not args.peft:
+    if args.relora and not args.use_peft:
         logger.warning("--relora assumes --use_peft. Setting --use_peft=True")
         args.use_peft = True
 
