@@ -164,7 +164,7 @@ class ReLoRaLinear(nn.Linear):
             self.lora_A = nn.Linear(in_features, r, bias=False)
             self.lora_B = nn.Linear(r, out_features, bias=False)
             if trainable_scaling:
-                self.scaling = nn.Parameter(torch.tensor([0.]), requires_grad=True)
+                self.scaling = nn.Parameter(torch.tensor([1.]), requires_grad=True)
             else:
                 self.scaling = self.lora_alpha / self.r
 
