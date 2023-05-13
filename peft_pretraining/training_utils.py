@@ -31,7 +31,7 @@ def get_scheculer(
         )
     if scheduler_type == "cosine_restarts":
         assert restart_warmup_steps is not None, "restart_warmup_steps must be specified for cosine_restarts scheduler"
-        return transformers.get_cosine_with_hard_restarts_schedule_with_warmup(
+        return get_cosine_schedule_with_multiple_warmups(
             optimizer,
             num_training_steps=num_training_steps,
             first_warmup_steps=warmup_steps,
@@ -61,7 +61,16 @@ def get_cyclical_cosine_schedule_with_min_lr(optimizer, num_warmup_steps, num_tr
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 
 
-def get_cosine_with_hard_restarts_schedule_with_warmup(optimizer, num_training_steps, first_warmup_steps, restart_warmup_steps, restart_every, min_lr_ratio=0.1, last_epoch=-1):
+def get_cosine_schedule_with_multiple_warmups(
+    optimizer,
+    *,
+    num_training_steps,
+    first_warmup_steps,
+    restart_warmup_steps,
+    restart_every,
+    min_lr_ratio=0.1,
+    last_epoch=-1,
+):
     if restart_every is None:
         raise ValueError("restart_every must be specified for cosine_restarts scheduler")
 
