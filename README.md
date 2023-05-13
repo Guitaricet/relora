@@ -10,7 +10,7 @@ wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O ~/
 bash miniconda.sh -b
 /root/miniconda3/bin/conda init
 
-bash
+bash  # to enable conda
 
 git clone https://github.com/guitaricet/peft_pretraining
 cd peft_pretraining

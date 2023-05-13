@@ -1,6 +1,8 @@
 checkpoints
 **/wandb/**
 wandb
+ignore
+experimental_data
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

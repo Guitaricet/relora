@@ -12,14 +12,16 @@
             "console": "integratedTerminal",
             "justMyCode": true,
             "args": [
-                "--model_config", "peft_pretraining/llama_small.json",
+                "--model_config", "configs/llama_9m.json",
                 "--use_peft",
+                "--lora_r", "32",
                 "--relora", "100",
-                "--train_ln",
+                "--reset_optimizer_on_relora", "False",
                 "--device", "cuda:0",
                 "--lr", "0.0005",
-                "--batch_size", "48",
-                "--dtype", "bfloat16"
+                "--batch_size", "240",
+                "--dtype", "bfloat16",
+                "--tags", "vscode_debugger",
             ]
         }
     ]
