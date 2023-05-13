@@ -3,9 +3,7 @@ import time
 import json
 import random
 import argparse
-from datetime import datetime
 from typing import Union
-from pprint import pformat
 from functools import partial
 
 import numpy as np
@@ -28,6 +26,8 @@ from loguru import logger
 from peft_pretraining import training_utils, args_utils
 from peft_pretraining.relora import ReLoRaModel, ReLoRaLinear
 
+transformers.logging.set_verbosity_error()
+
 
 def parse_args(args):
     parser = argparse.ArgumentParser()
@@ -49,8 +49,10 @@ def parse_args(args):
                         help="Instead of resetting optimizer, take top-k singular values of the optimizer matrix.")
     parser.add_argument("--keep_first_opt_rows", default=0, type=int,
                         help="Instead of resetting optimizer, zero all but --keep_first_opt_rows rows in matricies")
-    parser.add_argument("--optimizer_random_projection", default=0, type=int,
-                        help="Use Johnson-Lindenstrauss random projection to reduce optimizer matrix internal dimensionality.")
+    parser.add_argument("--optimizer_random_pruning", default=0.0, type=float,
+                        help="Use random pruning to reduce optimizer matrix internal dimensionality.")
+    parser.add_argument("--optimizer_magnitude_pruning", default=0.0, type=float,
+                        help="Use magnitude pruning to reduce optimizer matrix internal dimensionality.")
     parser.add_argument("--force_keep_original", default=False, action="store_true",
                         help=("Keep original model parameters even if relora is None. "
                               "Useful for making sure that full-LoRa model is equivalent to model+LoRa."))
@@ -77,7 +79,6 @@ def parse_args(args):
     parser.add_argument("--tags", type=str, default=None)
     parser.add_argument("--dtype", type=str, default="bfloat16" if torch.cuda.is_bf16_supported() else "float32")
 
-    parser.add_argument("--distributed_port", type=int, default=29500)
     parser.add_argument("--seed", type=int, default=0)
 
     args = parser.parse_args(args)
@@ -101,7 +102,6 @@ def main(args):
     # assumes that we are using a single node
     torch.distributed.init_process_group(
         backend="nccl",
-        init_method=f"tcp://127.0.0.1:{args.distributed_port}",
         rank=args.local_rank,
         world_size=torch.cuda.device_count()
     )
@@ -348,12 +348,6 @@ def main(args):
         scaled_loss = loss / args.gradient_accumulation
         scaled_loss.backward()
 
-        if local_step < 10 and global_rank == 0:
-            # kind of logging this out of desperation
-            logger.info(f"Loss at step {local_step}: {loss.item()}")
-            lr = optimizer.param_groups[0]["lr"]
-            wandb.log({"loss": loss.item(), "lr": lr}, step=global_step)
-
         if global_step % args.gradient_accumulation != 0:
             continue
 
@@ -426,14 +420,22 @@ def main(args):
                     params_reset += max(0, param_state["exp_avg"].shape[0] - args.keep_first_opt_rows) * param_state["exp_avg"].shape[1]
                     params_total += param_state["exp_avg"].shape[0] * param_state["exp_avg"].shape[1]
                 logger.info(f"Percent of optimizer states reset: {params_reset / params_total * 100}")
-            
-            if args.optimizer_random_projection:
-                logger.info(f"Performing random projection of optimizer states. Projecting to {args.optimizer_random_projection} dimensions")
+
+            if args.optimizer_random_pruning:
+                logger.info(f"Performing random pruning of optimizer states. Pruning to {args.optimizer_random_pruning} percent")
                 for p in lora_params:
                     param_state = optimizer.state[p]
-                    js_proj = partial(training_utils.random_projection_dim_reduction, target_dim=args.optimizer_random_projection)
-                    param_state["exp_avg"] = js_proj(param_state["exp_avg"])
-                    param_state["exp_avg_sq"] = js_proj(param_state["exp_avg_sq"])
+                    reduction = partial(training_utils.random_pruning, prune_ratio=args.optimizer_random_pruning)
+                    param_state["exp_avg"] = reduction(param_state["exp_avg"])
+                    param_state["exp_avg_sq"] = reduction(param_state["exp_avg_sq"])
+
+            if args.optimizer_magnitude_pruning:
+                logger.info(f"Performing magnitude pruning of optimizer states. Pruning to {args.optimizer_magnitude_pruning} percent")
+                for p in lora_params:
+                    param_state = optimizer.state[p]
+                    reduction = partial(training_utils.magnitude_pruning, prune_ratio=args.optimizer_magnitude_pruning)
+                    param_state["exp_avg"] = reduction(param_state["exp_avg"])
+                    param_state["exp_avg_sq"] = reduction(param_state["exp_avg_sq"])
 
         if args.relora and update_step > args.relora and update_step % args.relora == 2:
             logger.info(f"First step after lora reset lr is {optimizer.param_groups[0]['lr']}")
