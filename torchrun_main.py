@@ -6,6 +6,7 @@ import argparse
 from datetime import datetime
 from typing import Union
 from pprint import pformat
+from functools import partial
 
 import numpy as np
 
@@ -48,6 +49,8 @@ def parse_args(args):
                         help="Instead of resetting optimizer, take top-k singular values of the optimizer matrix.")
     parser.add_argument("--keep_first_opt_rows", default=0, type=int,
                         help="Instead of resetting optimizer, zero all but --keep_first_opt_rows rows in matricies")
+    parser.add_argument("--optimizer_random_projection", default=0, type=int,
+                        help="Use Johnson-Lindenstrauss random projection to reduce optimizer matrix internal dimensionality.")
     parser.add_argument("--force_keep_original", default=False, action="store_true",
                         help=("Keep original model parameters even if relora is None. "
                               "Useful for making sure that full-LoRa model is equivalent to model+LoRa."))
@@ -423,6 +426,14 @@ def main(args):
                     params_reset += max(0, param_state["exp_avg"].shape[0] - args.keep_first_opt_rows) * param_state["exp_avg"].shape[1]
                     params_total += param_state["exp_avg"].shape[0] * param_state["exp_avg"].shape[1]
                 logger.info(f"Percent of optimizer states reset: {params_reset / params_total * 100}")
+            
+            if args.optimizer_random_projection:
+                logger.info(f"Performing random projection of optimizer states. Projecting to {args.optimizer_random_projection} dimensions")
+                for p in lora_params:
+                    param_state = optimizer.state[p]
+                    js_proj = partial(training_utils.random_projection_dim_reduction, num_components=args.optimizer_random_projection)
+                    param_state["exp_avg"] = js_proj(param_state["exp_avg"])
+                    param_state["exp_avg_sq"] = js_proj(param_state["exp_avg_sq"])
 
         if args.relora and update_step > args.relora and update_step % args.relora == 2:
             logger.info(f"First step after lora reset lr is {optimizer.param_groups[0]['lr']}")

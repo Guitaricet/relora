@@ -100,6 +100,22 @@ def svd_internal_dimensionality_reduction(tensor, num_components):
     return torch.matmul(u[:, :num_components] * s[:num_components], v[:, :num_components].T).to(dtype=original_dtype)
 
 
+def random_projection_dim_reduction(tensor, target_dim):
+    """
+    Performs random projection dimensionality reduction according to the Johnson-Lindenstrauss lemma.
+    Only reduces the inner dimensionality, does not affect the shape of the tensor
+    """
+    original_dtype = tensor.dtype
+    tensor = tensor.to(dtype=torch.float32)
+
+    # generate a random matrix with entries drawn from a normal distribution
+    random_matrix = torch.randn(tensor.shape[-1], target_dim, dtype=torch.float32, device=tensor.device)
+    random_matrix /= torch.norm(random_matrix, dim=0, keepdim=True)
+
+    # project the tensor onto the random matrix
+    return torch.matmul(tensor, random_matrix).to(dtype=original_dtype)
+
+
 def _get_cyclical_cosine_schedule_with_min_lr_lambda(current_step, *, num_warmup_steps, cycle_length, min_lr_ratio):
     assert 0 < min_lr_ratio <= 1.0, "min_lr_ratio must be in (0,1]"
 

@@ -38,7 +38,11 @@ def check_args_torchrun_main(args):
     if args.dtype in ["fp16", "float16"]:
         raise NotImplementedError("fp16 is not supported in torchrun_main.py. Use deepspeed_main.py instead (but it seems to have bugs)")
 
-    if int(args.reset_optimizer_on_relora) + int(bool(args.svd_optimizer_on_relora)) + int(bool(args.keep_first_opt_rows)) > 1:
+    if (int(args.reset_optimizer_on_relora) +
+        int(bool(args.svd_optimizer_on_relora)) +
+        int(bool(args.keep_first_opt_rows)) +
+        int(bool(args.optimizer_random_projection))
+        ) > 1:
         raise ValueError("reset_optimizer_on_relora, svd_optimizer_on_relora, and keep_first_opt_rows are mutually exclusive")
 
     if args.relora and not args.use_peft:
