@@ -431,7 +431,7 @@ def main(args):
                 logger.info(f"Performing random projection of optimizer states. Projecting to {args.optimizer_random_projection} dimensions")
                 for p in lora_params:
                     param_state = optimizer.state[p]
-                    js_proj = partial(training_utils.random_projection_dim_reduction, num_components=args.optimizer_random_projection)
+                    js_proj = partial(training_utils.random_projection_dim_reduction, target_dim=args.optimizer_random_projection)
                     param_state["exp_avg"] = js_proj(param_state["exp_avg"])
                     param_state["exp_avg_sq"] = js_proj(param_state["exp_avg_sq"])
 
