@@ -44,6 +44,10 @@ def parse_args(args):
     parser.add_argument("--relora", type=int, default=None)
     parser.add_argument("--train_scaling", default=False, action="store_true")
     parser.add_argument("--reset_optimizer_on_relora", default=True, type=lambda x: x.lower() == "true")
+    parser.add_argument("--svd_optimizer_on_relora", default=0, type=int,
+                        help="Instead of resetting optimizer, take top-k singular values of the optimizer matrix.")
+    parser.add_argument("--keep_first_opt_rows", default=0, type=int,
+                        help="Instead of resetting optimizer, zero all but --keep_first_opt_rows rows in matricies")
     parser.add_argument("--force_keep_original", default=False, action="store_true",
                         help=("Keep original model parameters even if relora is None. "
                               "Useful for making sure that full-LoRa model is equivalent to model+LoRa."))
@@ -106,6 +110,9 @@ def parse_args(args):
 
     if args.dtype in ["fp16", "float16"]:
         raise NotImplementedError("fp16 is not supported in torchrun_main.py. Use deepspeed_main.py instead (but it seems to have bugs)")
+
+    if args.reset_optimizer_on_relora ^ bool(args.svd_optimizer_on_relora) ^ bool(args.keep_first_opt_rows):
+        raise ValueError("reset_optimizer_on_relora, svd_optimizer_on_relora, and keep_first_opt_rows are mutually exclusive")
 
     return args
 
@@ -296,6 +303,7 @@ def main(args):
     p_trainable_params = n_trainable_params / n_total_params
 
     trainable_params = (p for p in model.parameters() if p.requires_grad)
+    lora_params = (p for p in model.parameters() if p.requires_grad and "lora_" in p.name)
     trainable_params_names = [name for name, p in model.named_parameters() if p.requires_grad]
 
     # Initialize wandb
@@ -421,11 +429,31 @@ def main(args):
 
             if args.reset_optimizer_on_relora:
                 logger.info("Resetting optimizer states to zeros")
-                for group in optimizer.param_groups:
-                    for p in group["params"]:
-                        param_state = optimizer.state[p]
-                        param_state["exp_avg"] = torch.zeros_like(p.data)
-                        param_state["exp_avg_sq"] = torch.zeros_like(p.data)
+                for p in lora_params:
+                    param_state = optimizer.state[p]
+                    param_state["exp_avg"] = torch.zeros_like(p.data)
+                    param_state["exp_avg_sq"] = torch.zeros_like(p.data)
+
+            if args.svd_optimizer_on_relora:
+                logger.info("Performing SVD on optimizer states (going to take some time)")
+                for p in tqdm(lora_params, desc="SVDing optimizer states"):
+                    param_state = optimizer.state[p]
+                    param_state["exp_avg"] = training_utils.svd_internal_dimensionality_reduction(param_state["exp_avg"])
+                    param_state["exp_avg_sq"] = training_utils.svd_internal_dimensionality_reduction(param_state["exp_avg_sq"])
+
+            if args.keep_first_opt_rows:
+                # a.k.a "simple dimensionality reduction"
+                logger.info(f"Performing partial reset of the optimizer states. Keeping first {args.keep_first_opt_rows} rows")
+                params_reset = 0
+                params_total = 0
+                for p in lora_params:
+                    param_state = optimizer.state[p]
+                    param_state["exp_avg"][args.keep_first_opt_rows:] = 0
+                    param_state["exp_avg_sq"][args.keep_first_opt_rows:] = 0
+                    assert param_state["exp_avg"].ndim == 2, "All our weight matrices are 2D matrices, right?"
+                    params_reset += max(0, param_state["exp_avg"].shape[0] - args.keep_first_opt_rows) * param_state["exp_avg"].shape[1]
+                    params_total += param_state["exp_avg"].shape[0] * param_state["exp_avg"].shape[1]
+                logger.info(f"Percent of optimizer states reset: {params_reset / params_total * 100}")
 
         if args.relora and update_step > args.relora and update_step % args.relora == 2:
             logger.info(f"First step after lora reset lr is {optimizer.param_groups[0]['lr']}")
