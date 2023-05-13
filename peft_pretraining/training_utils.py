@@ -94,7 +94,7 @@ def svd_internal_dimensionality_reduction(tensor, num_components):
     Performs SVD dimensionality reduction, but returns the full tensor instead of just the reduced components.
     """
     original_dtype = tensor.dtype
-    u, s, v = torch.svd(tensor.to(dtype=torch.float32))
+    u, s, v = torch.svd(tensor.to(dtype=torch.float64))
     return torch.matmul(u[:, :num_components] * s[:num_components], v[:, :num_components].T).to(dtype=original_dtype)
 
 
