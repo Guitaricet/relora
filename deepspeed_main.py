@@ -292,6 +292,13 @@ def main(args):
         if (trainable_after >= trainable_before):
             raise ValueError("Total number of trainable parameters should decrease after applying LoRA with restarts")
 
+    n_total_params = sum(p.numel() for p in model.parameters())
+    n_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    p_trainable_params = n_trainable_params / n_total_params
+
+    trainable_params = (p for p in model.parameters() if p.requires_grad)
+    trainable_params_names = [name for name, p in model.named_parameters() if p.requires_grad]
+
     # Initialize DeepSpeed
     # Prefer to make config here instead of a file to reduce the number of files
     # Reproducibility is enabled through WandB
@@ -319,12 +326,7 @@ def main(args):
     )
     model: Union[ReLoRaModel, deepspeed.DeepSpeedEngine, LlamaForCausalLM]  # help with type checking
 
-    n_total_params = sum(p.numel() for p in model.parameters())
-    n_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    p_trainable_params = n_trainable_params / n_total_params
-
-    trainable_params = (p for p in model.parameters() if p.requires_grad)
-    trainable_params_names = [name for name, p in model.named_parameters() if p.requires_grad]
+    trainable_params = (p for p in model.parameters() if p.requires_grad)  # update trainable params after initializing deepspeed
 
     # Initialize wandb
     _config = dict(vars(args))
