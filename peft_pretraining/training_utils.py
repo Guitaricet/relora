@@ -88,6 +88,7 @@ def get_cosine_schedule_with_multiple_warmups(
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 
 
+@torch.no_grad()
 def svd_internal_dimensionality_reduction(tensor, num_components):
     """
     Performs SVD dimensionality reduction, but returns the full tensor instead of just the reduced components.
