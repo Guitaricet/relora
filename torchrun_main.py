@@ -426,7 +426,7 @@ def main(args):
         if args.relora and update_step > args.relora and update_step % args.relora == 1:
             logger.info(f"Performing lora reset. Current lr is {optimizer.param_groups[0]['lr']}")
             n_lora_restarts += 1
-            model.merge_and_reinit()
+            model.module.merge_and_reinit()
 
             if args.reset_optimizer_on_relora:
                 logger.info("Resetting optimizer states to zeros")
