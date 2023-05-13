@@ -124,7 +124,7 @@ def random_pruning(tensor, prune_ratio):
     Performs random pruning dimensionality reduction.
     Only reduces the inner dimensionality, does not affect the shape of the tensor
     """
-    random_pruning_mask = torch.rand(tensor.shape[-1], dtype=torch.float32, device=tensor.device) > prune_ratio
+    random_pruning_mask = torch.rand_like(tensor) > prune_ratio
     tensor = tensor * random_pruning_mask
     return tensor
 
