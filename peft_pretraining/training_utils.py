@@ -136,7 +136,7 @@ def magnitude_pruning(tensor, prune_ratio):
     Only reduces the inner dimensionality, does not affect the shape of the tensor
     """
     tensor_magnitude = torch.abs(tensor)
-    threshold = torch.quantile(tensor_magnitude.flatten(), prune_ratio)
+    threshold = torch.quantile(tensor_magnitude.flatten().to(dtype=torch.float32), prune_ratio).to(dtype=tensor.dtype)
 
     mask = tensor_magnitude > threshold
     tensor = tensor * mask.to(dtype=tensor.dtype)
