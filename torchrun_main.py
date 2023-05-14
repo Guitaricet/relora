@@ -9,8 +9,8 @@ from functools import partial
 import numpy as np
 
 import torch
-import torch._dynamo
 import torch.nn as nn
+import torch.utils.data
 import torch.distributed
 
 import transformers
@@ -26,11 +26,11 @@ from tqdm import tqdm
 from loguru import logger
 
 from peft_pretraining import training_utils, args_utils
+from peft_pretraining.dataloader import PreprocessedIterableDataset
 from peft_pretraining.modeling_llama import LlamaForCausalLM
 from peft_pretraining.relora import ReLoRaModel, ReLoRaLinear
 
 transformers.logging.set_verbosity_error()
-torch._dynamo.config.verbose=True
 
 
 def parse_args(args):
@@ -85,6 +85,7 @@ def parse_args(args):
     parser.add_argument("--save_dir", type=str, default=None)
     parser.add_argument("--tags", type=str, default=None)
     parser.add_argument("--dtype", type=str, default="bfloat16" if torch.cuda.is_bf16_supported() else "float32")
+    parser.add_argument("--workers", type=int, default=8)
 
     parser.add_argument("--seed", type=int, default=0)
 
@@ -203,15 +204,8 @@ def main(args):
         )
         return batch
 
-    data_mapped = data.map(
-        preprocess_batched,
-        batched=True,
-        remove_columns=["text", "timestamp", "url"],
-    )
-
-    # Very inefficient, but we are bottlenecked by the model anyway
-    # as long as the model is large enough
-    data_mapped.batch = lambda batch_size: training_utils.batch_fn(data_mapped, batch_size)
+    dataset = PreprocessedIterableDataset(data, tokenizer, batch_size=args.batch_size, max_length=args.max_length)
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=None, num_workers=args.workers)
 
     model_config = AutoConfig.from_pretrained(args.model_config)
     if args.use_hf_model:
@@ -297,8 +291,7 @@ def main(args):
     logger.info(f"Total params after  LoRA: {params_after / 1_000_000:.2f}M")
     logger.info(f"Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1_000_000:.2f}M")
 
-    if args.save_dir:
-        logger.info(f"Saving model to {args.save_dir} every {args.save_every} update steps")
+    logger.info(f"Saving model to {args.save_dir} every {args.save_every} update steps")
 
     if args.use_peft and args.relora is not None:
         if (params_after <= params_before):
@@ -311,10 +304,6 @@ def main(args):
         model = model.to(device=device, dtype=torch.bfloat16)
     else:
         model = model.to(device=device)
-
-    # logger.info("Compiling model...")
-    # model = torch.compile(model)
-    # logger.info("Model successfully compiled")
 
     model: Union[ReLoRaModel, LlamaForCausalLM] = torch.nn.parallel.DistributedDataParallel(
         model,
@@ -383,8 +372,12 @@ def main(args):
     update_time = time.time()
     local_step = 0  # when continue_from is used, local_step != global_step
 
+    # ##############################
+    # TRAINING LOOP
     # we'll never go through all the data, so no need for epochs
-    for batch in data_mapped.batch(batch_size=args.batch_size):
+    # ##############################
+
+    for batch in dataloader:
         global_step += 1
         local_step += 1
 
@@ -477,20 +470,32 @@ def main(args):
                 logger.info(f"Percent of optimizer states reset: {params_reset / params_total * 100}")
 
             if args.optimizer_random_pruning:
-                logger.info(f"Performing random pruning of optimizer states. Pruning to {args.optimizer_random_pruning} percent")
+                logger.info(f"Performing random pruning of optimizer states. Pruning {args.optimizer_random_pruning} percent")
+                n_zeros = 0
+                n_total = 0
+
                 for p in lora_params:
                     param_state = optimizer.state[p]
                     reduction = partial(training_utils.random_pruning, prune_ratio=args.optimizer_random_pruning)
                     param_state["exp_avg"] = reduction(param_state["exp_avg"])
                     param_state["exp_avg_sq"] = reduction(param_state["exp_avg_sq"])
 
+                logger.info(f"Percent of optimizer states zeroed: {n_zeros / n_total * 100:.2f}")
+
             if args.optimizer_magnitude_pruning:
-                logger.info(f"Performing magnitude pruning of optimizer states. Pruning to {args.optimizer_magnitude_pruning} percent")
+                logger.info(f"Performing magnitude pruning of optimizer states. Pruning {args.optimizer_magnitude_pruning} percent")
+                n_zeros = 0
+                n_total = 0
                 for p in lora_params:
                     param_state = optimizer.state[p]
                     reduction = partial(training_utils.magnitude_pruning, prune_ratio=args.optimizer_magnitude_pruning)
                     param_state["exp_avg"] = reduction(param_state["exp_avg"])
                     param_state["exp_avg_sq"] = reduction(param_state["exp_avg_sq"])
+
+                    n_zeros += (param_state["exp_avg"] == 0).sum()
+                    n_total += param_state["exp_avg"].numel()
+                
+                logger.info(f"Percent of optimizer states zeroed: {n_zeros / n_total * 100:.2f}")
 
         if args.relora and update_step > args.relora and update_step % args.relora == 2:
             logger.info(f"First step after lora reset lr is {optimizer.param_groups[0]['lr']}")
@@ -534,7 +539,11 @@ def main(args):
                         all_scaling_factors.append(module.scaling.data.item())
                 wandb.log({"lora_scaling": torch.tensor(all_scaling_factors)}, step=global_step)
         update_time = time.time()
+        prof.step()
 
+    # ##############################
+    # END of training loop
+    # ##############################
     logger.info("Training finished")
     if global_rank == 0: pbar.close()
 
