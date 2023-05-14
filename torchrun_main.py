@@ -68,6 +68,9 @@ def parse_args(args):
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--warmup_steps", type=int, default=1_000)
 
+    parser.add_argument("--eval_every", type=int, default=None,
+                        help="By default only evaluate at the end of training.")
+
     parser.add_argument("--num_training_steps", type=int, default=10_000,
                         help="Number of **update steps** to train for. "
                              "Notice that gradient accumulation is taken into account.")
@@ -86,6 +89,48 @@ def parse_args(args):
     args = args_utils.check_args_torchrun_main(args)
 
     return args
+
+
+@torch.no_grad()
+def evaluate_model(model, preprocess_batched, pad_idx, global_rank, world_size, device, batch_size):
+    val_data = datasets.load_dataset("c4", "en", split="validation", streaming=True)
+    val_data = val_data.shuffle(seed=42)
+
+    val_data = datasets.distributed.split_dataset_by_node(val_data, rank=global_rank, world_size=world_size)
+
+    val_data_mapped = val_data.map(
+        preprocess_batched,
+        batched=True,
+        remove_columns=["text", "timestamp", "url"],
+    )
+    val_data_mapped.batch = lambda batch_size: training_utils.batch_fn(val_data_mapped, batch_size)
+
+    target_eval_tokens = 10_000_000
+    evaluated_on_tokens = 0
+    total_loss = torch.tensor(0.0).to(device)
+    total_batches = 1
+
+    for batch in val_data_mapped.batch(batch_size=batch_size):
+        if evaluated_on_tokens > target_eval_tokens:
+            break
+        total_batches += 1
+
+        batch = {k: v.to(device) for k, v in batch.items()}
+        labels = batch["input_ids"].clone()
+        labels[labels == pad_idx] = -100
+        loss = model(**batch, labels=labels).loss
+        total_loss += loss.detach()
+
+        evaluated_on_tokens += (batch["input_ids"] != pad_idx).sum().item() * world_size
+
+    total_loss = total_loss / total_batches
+
+    # Gather losses across all GPUs
+    gathered_losses = [torch.zeros_like(total_loss) for _ in range(world_size)]
+    torch.distributed.all_gather(gathered_losses, total_loss)
+    total_loss = sum([t.item() for t in gathered_losses]) / world_size
+
+    return total_loss, evaluated_on_tokens
 
 
 def main(args):
@@ -133,11 +178,9 @@ def main(args):
     dataset_name = "c4"  # switch to "togethercomputer/RedPajama-Data-1T" later
     assert dataset_name == "c4"
     data = datasets.load_dataset("c4", "en", split="train", streaming=True)
-    val_data = datasets.load_dataset("c4", "en", split="validation", streaming=True)
 
     # this seed is hard-coded to guarantee the same order of the examples (for any --seed)
     data: datasets.Dataset = data.shuffle(seed=42)
-    val_data: datasets.Dataset = val_data.shuffle(seed=42)  # not sure if C4 val set is shuffled originally
     data = datasets.distributed.split_dataset_by_node(
         data, rank=global_rank, world_size=world_size,
     )
@@ -303,7 +346,7 @@ def main(args):
     if global_rank == 0:
         wandb.init(project="peft_pretraining", config=_config, tags=args.tags)
         wandb.save(os.path.abspath(__file__), policy="now") # save current script
-        pbar = tqdm(total=args.num_training_steps * args.gradient_accumulation - update_step)
+        pbar = tqdm(total=args.num_training_steps - update_step)
 
     if args.optimizer.lower() == "lion":
         optimizer = Lion(trainable_params, lr=args.lr, weight_decay=args.weight_decay, use_triton=True)
@@ -333,7 +376,6 @@ def main(args):
         global_step += 1
         local_step += 1
 
-        if global_rank == 0: pbar.update(1)
         if update_step > args.num_training_steps:
             logger.info(f"Reached max number of update steps (f{args.num_training_steps}). Stopping training.")
             print(f"Rank {global_rank} stopping training.")
@@ -352,6 +394,7 @@ def main(args):
             continue
 
         # The below code is only executed during the update step
+        if global_rank == 0: pbar.update(1)
         optimizer.step()
         scheduler.step()
         optimizer.zero_grad()
@@ -359,9 +402,9 @@ def main(args):
         update_time = time.time() - update_time
 
         if update_step % args.save_every == 0 and global_rank == 0:
-            logger.info(f"Saving model and optimizer at update step {update_step}")
-            os.makedirs(args.save_dir, exist_ok=True)
             current_model_directory = f"{args.save_dir}/model_{update_step}"
+            logger.info(f"Saving model and optimizer to {current_model_directory}, update step {update_step}")
+            os.makedirs(args.save_dir, exist_ok=True)
             model.module.save_pretrained(current_model_directory)
 
             optimizer_checkpoint = {
@@ -440,6 +483,19 @@ def main(args):
         if args.relora and update_step > args.relora and update_step % args.relora == 2:
             logger.info(f"First step after lora reset lr is {optimizer.param_groups[0]['lr']}")
 
+        if args.evel_every and update_step % args.evel_every == 0:
+            total_loss, evaluated_on_tokens = evaluate_model(
+                model, preprocess_batched, pad_idx, global_rank, world_size, device, args.batch_size
+            )
+            if global_rank == 0:
+                wandb.log({
+                    "final_eval_loss": total_loss,
+                    "final_eval_tokens": evaluated_on_tokens,
+                    },
+                    step=global_step,
+                )
+            logger.info(f"Eval loss at step {update_step}: {total_loss}")
+
         lr = optimizer.param_groups[0]["lr"]
         tokens_in_update = tokens_seen - tokens_seen_before
         tokens_seen_before = tokens_seen
@@ -471,7 +527,7 @@ def main(args):
 
     current_model_directory = f"{args.save_dir}/model_{update_step}"
     if global_rank == 0 and not os.path.exists(current_model_directory):
-        logger.info(f"Saving model and optimizer at update step {update_step}")
+        logger.info(f"Saving model and optimizer to {current_model_directory}, update step {update_step}")
         os.makedirs(args.save_dir, exist_ok=True)
         model.module.save_pretrained(current_model_directory)
 
@@ -504,40 +560,9 @@ def main(args):
     import gc; gc.collect()
     torch.cuda.empty_cache()
 
-    val_data = datasets.distributed.split_dataset_by_node(
-        val_data, rank=global_rank, world_size=world_size,
+    total_loss, evaluated_on_tokens = evaluate_model(
+        model, preprocess_batched, pad_idx, global_rank, world_size, device, args.batch_size
     )
-    val_data_mapped = val_data.map(
-        preprocess_batched,
-        batched=True,
-        remove_columns=["text", "timestamp", "url"],
-    )
-    val_data_mapped.batch = lambda batch_size: training_utils.batch_fn(val_data_mapped, batch_size)
-
-    target_eval_tokens = 10_000_000
-    evaluated_on_tokens = 0
-    total_loss = torch.tensor(0.0).to(device)
-    total_batches = 1
-    with torch.no_grad():
-        for batch in val_data_mapped.batch(batch_size=args.batch_size):
-            if evaluated_on_tokens > target_eval_tokens:
-                break
-            total_batches += 1
-
-            batch = {k: v.to(device) for k, v in batch.items()}
-            labels = batch["input_ids"].clone()
-            labels[labels == pad_idx] = -100
-            loss = model(**batch, labels=labels).loss
-            total_loss += loss.detach()
-
-            evaluated_on_tokens += (batch["input_ids"] != pad_idx).sum().item() * world_size
-
-    total_loss = total_loss / total_batches
-
-    # gather across all GPUs
-    gathered_losses = [torch.zeros_like(total_loss) for _ in range(world_size)]
-    torch.distributed.all_gather(gathered_losses, total_loss)
-    total_loss = sum([t.item() for t in gathered_losses]) / world_size
 
     if global_rank == 0:
         wandb.log({
