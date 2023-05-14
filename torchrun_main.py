@@ -73,8 +73,7 @@ def parse_args(args):
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--warmup_steps", type=int, default=1_000)
 
-    parser.add_argument("--eval_every", type=int, default=None,
-                        help="By default only evaluate at the end of training.")
+    parser.add_argument("--eval_every", type=int, default=5_000)
 
     parser.add_argument("--num_training_steps", type=int, default=10_000,
                         help="Number of **update steps** to train for. "
@@ -497,6 +496,7 @@ def main(args):
             logger.info(f"First step after lora reset lr is {optimizer.param_groups[0]['lr']}")
 
         if args.eval_every and update_step % args.eval_every == 0:
+            logger.info(f"Performing evaluation at step {update_step}")
             total_loss, evaluated_on_tokens = evaluate_model(
                 model, preprocess_batched, pad_idx, global_rank, world_size, device, args.batch_size
             )
