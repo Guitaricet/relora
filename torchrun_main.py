@@ -331,6 +331,7 @@ def main(args):
         "name_trainable_params": trainable_params_names,
         "dataset": dataset_name,
         "model": model_config.to_dict(),
+        "world_size": world_size,
         "device": str(device),
     }
     _config.update(_config_ext)
