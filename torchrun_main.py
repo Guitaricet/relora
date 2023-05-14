@@ -468,7 +468,7 @@ def main(args):
                     assert param_state["exp_avg"].ndim == 2, "All our weight matrices are 2D matrices, right?"
                     params_reset += max(0, param_state["exp_avg"].shape[0] - args.keep_first_opt_rows) * param_state["exp_avg"].shape[1]
                     params_total += param_state["exp_avg"].shape[0] * param_state["exp_avg"].shape[1]
-                logger.info(f"Percent of optimizer states reset: {params_reset / params_total * 100}")
+                logger.info(f"Percent of optimizer states reset: {params_reset / (1e-7 + params_total * 100):.2f}")
 
             if args.optimizer_random_pruning:
                 logger.info(f"Performing random pruning of optimizer states. Pruning {args.optimizer_random_pruning} percent")
@@ -481,7 +481,7 @@ def main(args):
                     param_state["exp_avg"] = reduction(param_state["exp_avg"])
                     param_state["exp_avg_sq"] = reduction(param_state["exp_avg_sq"])
 
-                logger.info(f"Percent of optimizer states zeroed: {n_zeros / n_total * 100:.2f}")
+                logger.info(f"Percent of optimizer states zeroed: {n_zeros / (1e-7 + n_total * 100):.2f}")
 
             if args.optimizer_magnitude_pruning:
                 logger.info(f"Performing magnitude pruning of optimizer states. Pruning {args.optimizer_magnitude_pruning} percent")
