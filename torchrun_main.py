@@ -9,11 +9,13 @@ from functools import partial
 import numpy as np
 
 import torch
+import torch._dynamo
 import torch.nn as nn
 import torch.distributed
 
 import transformers
-from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM, LlamaForCausalLM
+from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
+from transformers import LlamaForCausalLM as HF_LlamaForCausalLM
 from lion_pytorch import Lion
 
 import datasets
@@ -24,15 +26,18 @@ from tqdm import tqdm
 from loguru import logger
 
 from peft_pretraining import training_utils, args_utils
+from peft_pretraining.modeling_llama import LlamaForCausalLM
 from peft_pretraining.relora import ReLoRaModel, ReLoRaLinear
 
 transformers.logging.set_verbosity_error()
+torch._dynamo.config.verbose=True
 
 
 def parse_args(args):
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--model_config", type=str, required=True)
+    parser.add_argument("--use_hf_model", default=False, action="store_true")
     parser.add_argument("--continue_from", type=str, default=None)
 
     parser.add_argument("--batch_size", type=int, required=True)
@@ -210,7 +215,11 @@ def main(args):
     data_mapped.batch = lambda batch_size: training_utils.batch_fn(data_mapped, batch_size)
 
     model_config = AutoConfig.from_pretrained(args.model_config)
-    model: Union[LlamaForCausalLM, nn.Module] = AutoModelForCausalLM.from_config(model_config)
+    if args.use_hf_model:
+        model: HF_LlamaForCausalLM = AutoModelForCausalLM.from_config(model_config)
+    else:
+        model = LlamaForCausalLM(model_config)
+
     if args.activation_checkpointing:
         model.gradient_checkpointing_enable()
 
@@ -303,6 +312,10 @@ def main(args):
         model = model.to(device=device, dtype=torch.bfloat16)
     else:
         model = model.to(device=device)
+
+    # logger.info("Compiling model...")
+    # model = torch.compile(model)
+    # logger.info("Model successfully compiled")
 
     model: Union[ReLoRaModel, LlamaForCausalLM] = torch.nn.parallel.DistributedDataParallel(
         model,
