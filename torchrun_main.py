@@ -185,7 +185,7 @@ def main(args):
     data = datasets.load_dataset("c4", "en", split="train", streaming=True)
 
     # this seed is hard-coded to guarantee the same order of the examples (for any --seed)
-    data: datasets.Dataset = data.shuffle(seed=42)
+    data: datasets.Dataset = data.shuffle(seed=42 + int(args.continue_from is not None))
     data = datasets.distributed.split_dataset_by_node(
         data, rank=global_rank, world_size=world_size,
     )
