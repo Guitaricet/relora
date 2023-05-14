@@ -539,7 +539,6 @@ def main(args):
                         all_scaling_factors.append(module.scaling.data.item())
                 wandb.log({"lora_scaling": torch.tensor(all_scaling_factors)}, step=global_step)
         update_time = time.time()
-        prof.step()
 
     # ##############################
     # END of training loop
