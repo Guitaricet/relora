@@ -481,7 +481,7 @@ def main(args):
                     param_state["exp_avg"] = reduction(param_state["exp_avg"])
                     param_state["exp_avg_sq"] = reduction(param_state["exp_avg_sq"])
 
-                logger.info(f"Percent of optimizer states zeroed: {n_zeros / (1e-7 + n_total * 100):.2f}")
+                logger.info(f"Percent of optimizer states zeroed: {n_zeros / (1e-7 + n_total) * 100:.2f}")
 
             if args.optimizer_magnitude_pruning:
                 logger.info(f"Performing magnitude pruning of optimizer states. Pruning {args.optimizer_magnitude_pruning} percent")
@@ -496,7 +496,7 @@ def main(args):
                     n_zeros += (param_state["exp_avg"] == 0).sum()
                     n_total += param_state["exp_avg"].numel()
                 
-                logger.info(f"Percent of optimizer states zeroed: {n_zeros / n_total * 100:.2f}")
+                logger.info(f"Percent of optimizer states zeroed: {n_zeros / (1e-7 + n_total) * 100:.2f}")
 
         if args.relora and update_step > args.relora and update_step % args.relora == 2:
             logger.info(f"First step after lora reset lr is {optimizer.param_groups[0]['lr']}")
