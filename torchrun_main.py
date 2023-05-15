@@ -407,7 +407,7 @@ def main(args):
         update_step += 1
         update_time = time.time() - update_time
 
-        if local_step > 10 and update_step % args.save_every == 0 and global_rank == 0:
+        if local_step > args.gradient_accumulation and update_step % args.save_every == 0 and global_rank == 0:
             current_model_directory = f"{args.save_dir}/model_{update_step}"
             logger.info(f"Saving model and optimizer to {current_model_directory}, update step {update_step}")
             os.makedirs(args.save_dir, exist_ok=True)
@@ -436,7 +436,7 @@ def main(args):
                 json.dump(training_state_checkpoint, f, indent=4)
 
         # restart model after we modify the learning rate, so on the next step after the relora frequency
-        if local_step > 10 and args.relora and update_step > args.relora and update_step % args.relora == 1:
+        if local_step > args.gradient_accumulation and args.relora and update_step > args.relora and update_step % args.relora == 1:
             logger.info(f"Performing lora reset. Current lr is {optimizer.param_groups[0]['lr']}")
             n_lora_restarts += 1
             model.module.merge_and_reinit()
@@ -498,7 +498,7 @@ def main(args):
                 
                 logger.info(f"Percent of optimizer states zeroed: {n_zeros / (1e-7 + n_total) * 100:.2f}")
 
-        if local_step > 10 and args.relora and update_step > args.relora and update_step % args.relora == 2:
+        if local_step > args.gradient_accumulation and args.relora and update_step > args.relora and update_step % args.relora == 2:
             logger.info(f"First step after lora reset lr is {optimizer.param_groups[0]['lr']}")
 
         if args.eval_every and update_step % args.eval_every == 0:
