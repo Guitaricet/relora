@@ -14,12 +14,14 @@ def get_scheculer(
     min_lr_ratio,
     cycle_length=None,
     restart_warmup_steps=None,
+    last_epoch=-1,
 ):
     if scheduler_type == "linear":
         return transformers.get_linear_schedule_with_warmup(
             optimizer,
             num_warmup_steps=warmup_steps,
             num_training_steps=num_training_steps,
+            last_epoch=last_epoch,
         )
     if scheduler_type == "cosine":
         return get_cyclical_cosine_schedule_with_min_lr(
@@ -28,6 +30,7 @@ def get_scheculer(
             num_training_steps=num_training_steps,
             cycle_length=cycle_length,
             min_lr_ratio=min_lr_ratio,
+            last_epoch=last_epoch,
         )
     if scheduler_type == "cosine_restarts":
         assert restart_warmup_steps is not None, "restart_warmup_steps must be specified for cosine_restarts scheduler"
@@ -38,6 +41,7 @@ def get_scheculer(
             restart_warmup_steps=restart_warmup_steps,
             restart_every=cycle_length,
             min_lr_ratio=min_lr_ratio,
+            last_epoch=last_epoch,
         )
 
     raise NotImplementedError(f"Scheduler {scheduler_type} is not implemented")

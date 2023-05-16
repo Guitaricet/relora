@@ -39,6 +39,7 @@ def parse_args(args):
     parser.add_argument("--model_config", type=str, required=True)
     parser.add_argument("--use_hf_model", default=False, action="store_true")
     parser.add_argument("--continue_from", type=str, default=None)
+    parser.add_argument("--restore_scheduler", default=False, action="store_true")
 
     parser.add_argument("--batch_size", type=int, required=True)
     parser.add_argument("--gradient_accumulation", type=int, default=None)
@@ -365,7 +366,10 @@ def main(args):
         min_lr_ratio=args.min_lr_ratio,
         cycle_length=args.cycle_length,
         restart_warmup_steps=args.restart_warmup_steps,
+        last_epoch=update_step if args.restore_scheduler else -1,
     )
+    if args.restore_scheduler:
+        logger.info(f"LR scheduler will start from update step {update_step}")
 
     # global steps and others are defined above
     n_lora_restarts = 0
