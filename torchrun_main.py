@@ -39,7 +39,7 @@ def parse_args(args):
     parser.add_argument("--model_config", type=str, required=True)
     parser.add_argument("--use_hf_model", default=False, action="store_true")
     parser.add_argument("--continue_from", type=str, default=None)
-    parser.add_argument("--restore_scheduler", default=False, action="store_true")
+    parser.add_argument("--restore_optimizer", default=False, action="store_true")
 
     parser.add_argument("--batch_size", type=int, required=True)
     parser.add_argument("--gradient_accumulation", type=int, default=None)
@@ -366,10 +366,15 @@ def main(args):
         min_lr_ratio=args.min_lr_ratio,
         cycle_length=args.cycle_length,
         restart_warmup_steps=args.restart_warmup_steps,
-        last_epoch=update_step if args.restore_scheduler else -1,
     )
-    if args.restore_scheduler:
-        logger.info(f"LR scheduler will start from update step {update_step}")
+
+    if args.continue_from is not None and args.restore_optimizer:
+        optimizer_checkpoint = torch.load(os.path.join(args.continue_from, "optimizer.pt"), map_location="cpu")
+        optimizer.load_state_dict(optimizer_checkpoint["optimizer"])
+        scheduler.load_state_dict(optimizer_checkpoint["scheduler"])
+        update_step = optimizer_checkpoint["update_step"]
+        global_step = optimizer_checkpoint["global_step"]
+        logger.info(f"Optimizer and scheduler restored from {args.continue_from}")
 
     # global steps and others are defined above
     n_lora_restarts = 0
