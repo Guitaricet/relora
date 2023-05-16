@@ -505,7 +505,7 @@ def main(args):
         if args.relora is not None and local_step * args.gradient_accumulation > args.relora and update_step % args.relora == 2:
             logger.info(f"First step after lora reset lr is {optimizer.param_groups[0]['lr']}")
 
-        if local_step * args.gradient_accumulation >= args.relora and update_step % args.eval_every == 0:
+        if update_step % args.eval_every == 0:
             logger.info(f"Performing evaluation at step {update_step}")
             total_loss, evaluated_on_tokens = evaluate_model(
                 model, preprocess_batched, pad_idx, global_rank, world_size, device, args.batch_size
