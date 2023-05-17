@@ -291,7 +291,7 @@ def main(args):
         logger.info(f"Model successfully loaded (strict=True policy)")
 
         logger.info(f"Loading training state like global_step, update_step, and tokens_seen from {args.continue_from}")
-        with open(os.path.join(args.continue_from, "training_state.json")) as f:
+        with open(os.path.join(args.continue_from_peft, "training_state.json")) as f:
             _old_state = json.load(f)
         global_step = _old_state["global_step"]
         update_step = _old_state["update_step"]
