@@ -473,7 +473,9 @@ def main(args):
                 json.dump(training_state_checkpoint, f, indent=4)
 
         # restart model after we modify the learning rate, so on the next step after the relora frequency
-        if args.relora is not None and local_step * args.gradient_accumulation > args.relora and update_step % args.relora == 1:
+        can_reset = args.continue_from_peft is not None or (args.relora is not None and local_step * args.gradient_accumulation > args.relora)
+
+        if can_reset and update_step % args.relora == 1:
             logger.info(f"Performing lora reset. Current lr is {optimizer.param_groups[0]['lr']}")
             n_lora_restarts += 1
             model.module.merge_and_reinit()
@@ -535,7 +537,7 @@ def main(args):
                 
                 logger.info(f"Percent of optimizer states zeroed: {n_zeros / (1e-7 + n_total) * 100:.2f}")
 
-        if args.relora is not None and local_step * args.gradient_accumulation > args.relora and update_step % args.relora == 2:
+        if can_reset and update_step % args.relora == 2:
             logger.info(f"First step after lora reset lr is {optimizer.param_groups[0]['lr']}")
 
         if update_step % args.eval_every == 0:
