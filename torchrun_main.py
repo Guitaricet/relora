@@ -290,6 +290,19 @@ def main(args):
         model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"), strict=True)
         logger.info(f"Model successfully loaded (strict=True policy)")
 
+        logger.info(f"Loading training state like global_step, update_step, and tokens_seen from {args.continue_from}")
+        with open(os.path.join(args.continue_from, "training_state.json")) as f:
+            _old_state = json.load(f)
+        global_step = _old_state["global_step"]
+        update_step = _old_state["update_step"]
+        tokens_seen = _old_state["tokens_seen"]
+        tokens_seen_before = _old_state["tokens_seen_before"]
+        logger.info(f"global_step       : {global_step}")
+        logger.info(f"update_step       : {update_step}")
+        logger.info(f"tokens_seen       : {tokens_seen}")
+        logger.info(f"tokens_seen_before: {tokens_seen_before}")
+        logger.info(f"Will train for {args.num_training_steps - update_step} update steps")
+
     params_after = sum(p.numel() for p in model.parameters())
     trainable_after = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
@@ -374,6 +387,14 @@ def main(args):
         cycle_length=args.cycle_length,
         restart_warmup_steps=args.restart_warmup_steps,
     )
+
+    if args.continue_from_peft:
+        logger.info("Setting scheduler to the same state as in the checkpoint")
+        for _ in range(update_step):
+            scheduler.step()
+        logger.info(f"Scheduler state restored from {args.continue_from_peft}")
+        # current lr
+        logger.info(f"Current lr is {optimizer.param_groups[0]['lr']}")
 
     if args.continue_from is not None and args.restore_optimizer:
         optimizer_checkpoint = torch.load(os.path.join(args.continue_from, "optimizer.pt"), map_location="cpu")
