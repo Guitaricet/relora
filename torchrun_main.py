@@ -287,7 +287,7 @@ def main(args):
     if args.continue_from_peft:
         logger.info(f"Loading model from {args.continue_from_peft}")
         checkpoint_path = os.path.join(args.continue_from_peft, "pytorch_model.bin")
-        model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"), strict=True)
+        model.wrapped_model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"), strict=True)
         logger.info(f"Model successfully loaded (strict=True policy)")
 
         logger.info(f"Loading training state like global_step, update_step, and tokens_seen from {args.continue_from}")
