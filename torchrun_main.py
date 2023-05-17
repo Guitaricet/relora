@@ -39,6 +39,7 @@ def parse_args(args):
     parser.add_argument("--model_config", type=str, required=True)
     parser.add_argument("--use_hf_model", default=False, action="store_true")
     parser.add_argument("--continue_from", type=str, default=None)
+    parser.add_argument("--continue_from_peft", type=str, default=None)
     parser.add_argument("--restore_optimizer", default=False, action="store_true")
 
     parser.add_argument("--batch_size", type=int, required=True)
@@ -282,6 +283,12 @@ def main(args):
                 param.requires_grad = True
             else:
                 param.requires_grad = False
+    
+    if args.continue_from_peft:
+        logger.info(f"Loading model from {args.continue_from_peft}")
+        checkpoint_path = os.path.join(args.continue_from_peft, "pytorch_model.bin")
+        model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"), strict=True)
+        logger.info(f"Model successfully loaded (strict=True policy)")
 
     params_after = sum(p.numel() for p in model.parameters())
     trainable_after = sum(p.numel() for p in model.parameters() if p.requires_grad)
