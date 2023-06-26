@@ -4,6 +4,8 @@ wandb
 ignore
 experimental_data
 log
+notebooks/*.pdf
+notebooks/*.png
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
