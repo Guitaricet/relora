@@ -5,6 +5,7 @@ import torch
 from torch.optim.lr_scheduler import LambdaLR
 import transformers
 
+
 def get_scheculer(
     optimizer,
     *,
@@ -14,8 +15,12 @@ def get_scheculer(
     min_lr_ratio,
     cycle_length=None,
     restart_warmup_steps=None,
+    adjust_step=0,
     last_epoch=-1,
 ):
+    if adjust_step != 0 and scheduler_type != "cosine_restarts":
+        raise ValueError("adjust_step is only supported for cosine_restarts scheduler")
+
     if scheduler_type == "linear":
         return transformers.get_linear_schedule_with_warmup(
             optimizer,
@@ -73,6 +78,7 @@ def get_cosine_schedule_with_multiple_warmups(
     restart_warmup_steps,
     restart_every,
     min_lr_ratio=0.1,
+    adjust_step=0,
     last_epoch=-1,
 ):
     if restart_every is None:
@@ -88,38 +94,9 @@ def get_cosine_schedule_with_multiple_warmups(
         restart_warmup_steps=restart_warmup_steps,
         restart_every=restart_every,
         min_lr_ratio=min_lr_ratio,
+        adjust_step=adjust_step,
     )
     return LambdaLR(optimizer, lr_lambda, last_epoch)
-
-
-@torch.no_grad()
-def svd_internal_dimensionality_reduction(tensor, num_components):
-    """
-    Performs SVD dimensionality reduction, but returns the full tensor instead of just the reduced components.
-    """
-    original_dtype = tensor.dtype
-    tensor = tensor.to(dtype=torch.float32)
-    # u, s, v = torch.svd(tensor.to(dtype=torch.float32))
-    u, s, v = torch.pca_lowrank(tensor, q=num_components, center=True, niter=2)
-    return torch.matmul(u[:, :num_components] * s[:num_components], v[:, :num_components].T).to(dtype=original_dtype)
-
-
-@torch.no_grad()
-def random_projection_dim_reduction(tensor, target_dim):
-    """
-    Performs random projection dimensionality reduction according to the Johnson-Lindenstrauss lemma.
-    Only reduces the inner dimensionality, does not affect the shape of the tensor
-    """
-    original_shape = tensor.shape
-
-    # generate a random matrix with entries drawn from a normal distribution
-    random_matrix = torch.randn(tensor.shape[-1], target_dim, dtype=torch.float32, device=tensor.device)
-    random_matrix /= torch.norm(random_matrix, dim=0, keepdim=True)
-
-    # project the tensor onto the random matrix
-    new_matrix = torch.matmul(tensor, random_matrix)
-    assert new_matrix.shape == original_shape[:-1] + (target_dim,)
-    return new_matrix
 
 
 @torch.no_grad()
@@ -173,15 +150,27 @@ def _get_cosine_schedule_with_multiple_warmups_lambda(
     restart_warmup_steps,
     restart_every,
     min_lr_ratio,
+    adjust_step,
 ):
+    """
+    Args:
+        adjust_step: useful when continuing training from a warmed up checkpoint,
+            it allows to sync the resets by reducing the number of steps
+            after the first warmup and before the first reset.
+            Thus, your ReLoRA resets can be synced with the optimizer resets.
+    """
     assert 0 < min_lr_ratio <= 1.0, "min_lr_ratio must be in (0,1]"
     assert restart_every > 0, "restart_every must be positive"
+    assert adjust_step + first_warmup_steps < num_training_steps, "warmup + adjust_step is more than full training steps"
+    assert adjust_step + first_warmup_steps < restart_every, "the first reset will happen before the warmup is done"
 
     if current_step < first_warmup_steps:
         return float(current_step) / float(max(1, first_warmup_steps))
 
-    restart_step = current_step % restart_every
-    restart_number = current_step // restart_every
+    _current_step = current_step + adjust_step
+
+    restart_step = _current_step % restart_every
+    restart_number = _current_step // restart_every
 
     if restart_step < restart_warmup_steps:
         # get expected lr multipler at the end of the warmup
@@ -195,7 +184,7 @@ def _get_cosine_schedule_with_multiple_warmups_lambda(
     
         return float(restart_step) / float(max(1, restart_warmup_steps)) * warmup_lr_multiplier
 
-    progress = float(current_step - first_warmup_steps) / float(max(1, num_training_steps - first_warmup_steps))
+    progress = float(_current_step - first_warmup_steps) / float(max(1, num_training_steps - first_warmup_steps))
     cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
 
     return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay

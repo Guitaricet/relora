@@ -66,6 +66,9 @@ def parse_args(args):
     parser.add_argument("--scheduler", type=str, default="cosine", choices=["linear", "cosine", "cosine_restarts"])
     parser.add_argument("--cycle_length", type=int, default=None, help="Number of steps per cycle for cosine scheduler")
     parser.add_argument("--restart_warmup_steps", type=int, default=None, help="Number of steps for cosine restarts (only used for cosine_restarts)")
+    parser.add_argument("--adjust_step", type=int, default=0, help="Number of steps to adjust the scheduler by. "
+                            f"Useful when you want to sync ReLoRA resets with the scheduler for a warmed up model. "
+                            f"You need to use it, when your warmup_step % relora_resets != 0")
     parser.add_argument("--min_lr_ratio", type=float, default=0.1)
     parser.add_argument("--activation_checkpointing", action="store_true")
     parser.add_argument("--weight_decay", type=float, default=0.0)
@@ -389,6 +392,7 @@ def main(args):
         min_lr_ratio=args.min_lr_ratio,
         cycle_length=args.cycle_length,
         restart_warmup_steps=args.restart_warmup_steps,
+        adjust_step=args.adjust_step,
     )
 
     if args.continue_from_peft:
@@ -476,7 +480,8 @@ def main(args):
                 json.dump(training_state_checkpoint, f, indent=4)
 
         # restart model after we modify the learning rate, so on the next step after the relora frequency
-        can_reset = args.continue_from_peft is not None or (args.relora is not None and local_step * args.gradient_accumulation > args.relora)
+        can_reset = args.continue_from_peft is not None \
+            or (args.relora is not None and local_step * args.gradient_accumulation > args.relora)
 
         if can_reset and update_step % args.relora == 1:
             logger.info(f"Performing lora reset. Current lr is {optimizer.param_groups[0]['lr']}")
@@ -489,6 +494,14 @@ def main(args):
                     param_state = optimizer.state[p]
                     for key in optimizer_state_keys:
                         param_state[key] = torch.zeros_like(p.data)
+            
+            # check optimizer learning rate
+            # scheduler should provide a new warmup after the reset
+            lr = optimizer.param_groups[0]["lr"]
+            if lr > 1e-6:
+                alert_message = f"Optimizer lr after the reset is large. This can lead to instability. Current lr is {lr}"
+                logger.warning(alert_message)
+                wandb.alert(title="Learning rate issue", text=alert_message, level=wandb.AlertLevel.WARN)
 
             if args.optimizer_random_pruning:
                 logger.info(f"Performing random pruning of optimizer states. Pruning {args.optimizer_random_pruning} percent")
