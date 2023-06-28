@@ -16,7 +16,6 @@ import torch.distributed
 import transformers
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
 from transformers import LlamaForCausalLM as HF_LlamaForCausalLM
-from lion_pytorch import Lion
 
 import datasets
 import datasets.distributed
@@ -29,6 +28,7 @@ from peft_pretraining import training_utils, args_utils
 from peft_pretraining.dataloader import PreprocessedIterableDataset
 from peft_pretraining.modeling_llama import LlamaForCausalLM
 from peft_pretraining.relora import ReLoRaModel, ReLoRaLinear
+from peft_pretraining.shampoo import Shampoo
 
 transformers.logging.set_verbosity_error()
 
@@ -52,10 +52,6 @@ def parse_args(args):
     parser.add_argument("--relora", type=int, default=None)
     parser.add_argument("--train_scaling", default=False, action="store_true")
     parser.add_argument("--reset_optimizer_on_relora", default=True, type=lambda x: x.lower() == "true")
-    parser.add_argument("--svd_optimizer_on_relora", default=0, type=int,
-                        help="Instead of resetting optimizer, take top-k singular values of the optimizer matrix.")
-    parser.add_argument("--keep_first_opt_rows", default=0, type=int,
-                        help="Instead of resetting optimizer, zero all but --keep_first_opt_rows rows in matricies")
     parser.add_argument("--optimizer_random_pruning", default=0.0, type=float,
                         help="Use random pruning to reduce optimizer matrix internal dimensionality.")
     parser.add_argument("--optimizer_magnitude_pruning", default=0.0, type=float,
@@ -65,7 +61,7 @@ def parse_args(args):
                               "Useful for making sure that full-LoRa model is equivalent to model+LoRa."))
 
     parser.add_argument("--train_ln", default=True, action="store_true")
-    parser.add_argument("--optimizer", default="Adam", choices=["Adam", "Lion"])
+    parser.add_argument("--optimizer", default="Adam", choices=["Adam", "Shampoo"])
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--scheduler", type=str, default="cosine", choices=["linear", "cosine", "cosine_restarts"])
     parser.add_argument("--cycle_length", type=int, default=None, help="Number of steps per cycle for cosine scheduler")
@@ -371,10 +367,17 @@ def main(args):
         wandb.save(os.path.abspath(__file__), policy="now") # save current script
         pbar = tqdm(total=args.num_training_steps - update_step)
 
-    if args.optimizer.lower() == "lion":
-        optimizer = Lion(trainable_params, lr=args.lr, weight_decay=args.weight_decay, use_triton=True)
-    elif args.optimizer.lower() == "adam":
+    optimizer_state_keys = None
+    if args.optimizer.lower() == "adam":
         optimizer = torch.optim.Adam(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+        optimizer_state_keys = ["exp_avg", "exp_avg_sq"]
+    elif args.optimizer.lower() == "shampoo":
+        optimizer = Shampoo(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+        # shampoo state looks like
+        # precond_{dim_id}, inv_precond_{dim_id}
+        # and, if momentum is used, momentum_buffer_{dim_id} — but we are currently not using momentum
+        parameter_state_example = optimizer.state[trainable_params[0]]
+        optimizer_state_keys = [n for n in parameter_state_example.keys() if "precond" in n or "momentum" in n]
     else:
         raise ValueError(f"Optimizer {args.optimizer} not supported")
 
@@ -484,30 +487,8 @@ def main(args):
                 logger.info("Resetting optimizer states to zeros")
                 for p in lora_params:
                     param_state = optimizer.state[p]
-                    param_state["exp_avg"] = torch.zeros_like(p.data)
-                    param_state["exp_avg_sq"] = torch.zeros_like(p.data)
-
-            if args.svd_optimizer_on_relora:
-                logger.info("Performing SVD on optimizer states (going to take some time)")
-                for p in tqdm(lora_params, desc="SVDing optimizer states"):
-                    param_state = optimizer.state[p]
-                    svd = training_utils.svd_internal_dimensionality_reduction
-                    param_state["exp_avg"] = svd(param_state["exp_avg"], num_components=args.svd_optimizer_on_relora)
-                    param_state["exp_avg_sq"] = svd(param_state["exp_avg_sq"], num_components=args.svd_optimizer_on_relora)
-
-            if args.keep_first_opt_rows:
-                # a.k.a "simple dimensionality reduction"
-                logger.info(f"Performing partial reset of the optimizer states. Keeping first {args.keep_first_opt_rows} rows")
-                params_reset = 0
-                params_total = 0
-                for p in lora_params:
-                    param_state = optimizer.state[p]
-                    param_state["exp_avg"][args.keep_first_opt_rows:] = 0
-                    param_state["exp_avg_sq"][args.keep_first_opt_rows:] = 0
-                    assert param_state["exp_avg"].ndim == 2, "All our weight matrices are 2D matrices, right?"
-                    params_reset += max(0, param_state["exp_avg"].shape[0] - args.keep_first_opt_rows) * param_state["exp_avg"].shape[1]
-                    params_total += param_state["exp_avg"].shape[0] * param_state["exp_avg"].shape[1]
-                logger.info(f"Percent of optimizer states reset: {params_reset / (1e-7 + params_total * 100):.2f}")
+                    for key in optimizer_state_keys:
+                        param_state[key] = torch.zeros_like(p.data)
 
             if args.optimizer_random_pruning:
                 logger.info(f"Performing random pruning of optimizer states. Pruning {args.optimizer_random_pruning} percent")
@@ -517,8 +498,8 @@ def main(args):
                 for p in lora_params:
                     param_state = optimizer.state[p]
                     reduction = partial(training_utils.random_pruning, prune_ratio=args.optimizer_random_pruning)
-                    param_state["exp_avg"] = reduction(param_state["exp_avg"])
-                    param_state["exp_avg_sq"] = reduction(param_state["exp_avg_sq"])
+                    for key in optimizer_state_keys:
+                        param_state[key] = reduction(param_state[key])
 
                 logger.info(f"Percent of optimizer states zeroed: {n_zeros / (1e-7 + n_total) * 100:.2f}")
 
@@ -529,12 +510,12 @@ def main(args):
                 for p in lora_params:
                     param_state = optimizer.state[p]
                     reduction = partial(training_utils.magnitude_pruning, prune_ratio=args.optimizer_magnitude_pruning)
-                    param_state["exp_avg"] = reduction(param_state["exp_avg"])
-                    param_state["exp_avg_sq"] = reduction(param_state["exp_avg_sq"])
+                    for key in optimizer_state_keys:
+                        param_state[key] = reduction(param_state[key])
 
-                    n_zeros += (param_state["exp_avg"] == 0).sum()
-                    n_total += param_state["exp_avg"].numel()
-                
+                    n_zeros += (param_state[optimizer_state_keys[0]] == 0).sum()
+                    n_total += param_state[optimizer_state_keys[0]].numel()
+
                 logger.info(f"Percent of optimizer states zeroed: {n_zeros / (1e-7 + n_total) * 100:.2f}")
 
         if can_reset and update_step % args.relora == 2:

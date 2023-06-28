@@ -58,12 +58,8 @@ Reset frequency is determined by `--relora` parameter (in the number of update s
 Optimizer reset options are: 
 ```
 "--reset_optimizer_on_relora", default=True, type=lambda x: x.lower() == "true"
-
-"--svd_optimizer_on_relora", default=0, type=int,
-help="Instead of resetting optimizer, take top-k singular values of the optimizer matrix."
-
-"--keep_first_opt_rows", default=0, type=int,
-help="Instead of resetting optimizer, zero all but --keep_first_opt_rows rows in matricies"
+"--optimizer_random_pruning", default=False, type=float
+"--optimizer_magnitude_pruning", default=False, type=float
 ```
 
 We curently support linear and cosine decay learning rate schedulers it is defined by 
