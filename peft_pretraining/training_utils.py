@@ -47,6 +47,7 @@ def get_scheculer(
             restart_every=cycle_length,
             min_lr_ratio=min_lr_ratio,
             last_epoch=last_epoch,
+            adjust_step=adjust_step,
         )
 
     raise NotImplementedError(f"Scheduler {scheduler_type} is not implemented")

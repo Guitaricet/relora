@@ -2,6 +2,7 @@ import os
 import time
 import json
 import random
+import hashlib
 import argparse
 from typing import Union
 from functools import partial
@@ -28,7 +29,6 @@ from peft_pretraining import training_utils, args_utils
 from peft_pretraining.dataloader import PreprocessedIterableDataset
 from peft_pretraining.modeling_llama import LlamaForCausalLM
 from peft_pretraining.relora import ReLoRaModel, ReLoRaLinear
-from peft_pretraining.shampoo import Shampoo
 
 transformers.logging.set_verbosity_error()
 
@@ -39,7 +39,7 @@ def parse_args(args):
     parser.add_argument("--model_config", type=str, required=True)
     parser.add_argument("--use_hf_model", default=False, action="store_true")
     parser.add_argument("--continue_from", type=str, default=None)
-    parser.add_argument("--continue_from_peft", type=str, default=None)
+    parser.add_argument("--continue_from_peft", type=str, default=None, help="Continue training with ReLoRA, loading optimizer and scheduler from the checkpoint.")
     parser.add_argument("--restore_optimizer", default=False, action="store_true")
 
     parser.add_argument("--batch_size", type=int, required=True)
@@ -94,13 +94,21 @@ def parse_args(args):
 
     args = args_utils.check_args_torchrun_main(args)
 
+    if args.continue_from_peft and not args.restore_optimizer:
+        logger.warning("--continue_from_peft is set, but --restore_optimizer is not. "
+                       "This means that you will train with the optimizer from the checkpoint, "
+                       "but will not save the optimizer state. "
+                       "This is probably not what you want.")
+
     return args
 
 
 @torch.no_grad()
 def evaluate_model(model, preprocess_batched, pad_idx, global_rank, world_size, device, batch_size):
+    _time = time.time()
     val_data = datasets.load_dataset("c4", "en", split="validation", streaming=True)
     val_data = val_data.shuffle(seed=42)
+    logger.info(f"Loaded validation dataset in {time.time() - _time:.2f} seconds")
 
     val_data = datasets.distributed.split_dataset_by_node(val_data, rank=global_rank, world_size=world_size)
 
@@ -115,6 +123,7 @@ def evaluate_model(model, preprocess_batched, pad_idx, global_rank, world_size, 
     evaluated_on_tokens = 0
     total_loss = torch.tensor(0.0).to(device)
     total_batches = 1
+    logger.info(f"Eval set prepared in {time.time() - _time:.2f} seconds")
 
     for batch in val_data_mapped.batch(batch_size=batch_size):
         if evaluated_on_tokens > target_eval_tokens:
@@ -181,12 +190,20 @@ def main(args):
         logger.info(f"{k:30} {v}")
     logger.info("*" * 40)
 
-    dataset_name = "c4"  # switch to "togethercomputer/RedPajama-Data-1T" later
+    dataset_name = "c4"
     assert dataset_name == "c4"
     data = datasets.load_dataset("c4", "en", split="train", streaming=True)
 
     # this seed is hard-coded to guarantee the same order of the examples (for any --seed)
-    data: datasets.Dataset = data.shuffle(seed=42 + int(args.continue_from is not None))
+    seed_for_shuffle = 42
+    if args.continue_from is not None:
+        # add hash of the path to the checkpoint to the seed
+        seed_for_shuffle += int(hashlib.sha256(args.continue_from.encode("utf-8")).hexdigest(), 16) % 10**8
+    if args.continue_from_peft is not None:
+        seed_for_shuffle += int(hashlib.sha256(args.continue_from_peft.encode("utf-8")).hexdigest(), 16) % 10**8
+
+    logger.info(f"Shuffling data with seed {seed_for_shuffle} (should be 42 for the first run and 42 + hash(checkpoint_path) for the runs that continue from a checkpoint)")
+    data: datasets.Dataset = data.shuffle(seed=seed_for_shuffle)
     data = datasets.distributed.split_dataset_by_node(
         data, rank=global_rank, world_size=world_size,
     )
@@ -368,19 +385,14 @@ def main(args):
     if global_rank == 0:
         wandb.init(project="peft_pretraining", config=_config, tags=args.tags)
         wandb.save(os.path.abspath(__file__), policy="now") # save current script
-        pbar = tqdm(total=args.num_training_steps - update_step)
+        # fix tqdm visual length to 80 so that the progress bar
+        # doesn't jump around when changing from external display to laptop
+        pbar = tqdm(total=args.num_training_steps - update_step, desc="Update steps", ncols=80)
 
     optimizer_state_keys = None
     if args.optimizer.lower() == "adam":
         optimizer = torch.optim.Adam(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
         optimizer_state_keys = ["exp_avg", "exp_avg_sq"]
-    elif args.optimizer.lower() == "shampoo":
-        optimizer = Shampoo(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
-        # shampoo state looks like
-        # precond_{dim_id}, inv_precond_{dim_id}
-        # and, if momentum is used, momentum_buffer_{dim_id} — but we are currently not using momentum
-        parameter_state_example = optimizer.state[trainable_params[0]]
-        optimizer_state_keys = [n for n in parameter_state_example.keys() if "precond" in n or "momentum" in n]
     else:
         raise ValueError(f"Optimizer {args.optimizer} not supported")
 
@@ -403,13 +415,14 @@ def main(args):
         # current lr
         logger.info(f"Current lr is {optimizer.param_groups[0]['lr']}")
 
-    if args.continue_from is not None and args.restore_optimizer:
-        optimizer_checkpoint = torch.load(os.path.join(args.continue_from, "optimizer.pt"), map_location="cpu")
+    if args.restore_optimizer:
+        _optimizer_dir = args.continue_from_peft or args.continue_from
+        optimizer_checkpoint = torch.load(os.path.join(_optimizer_dir, "optimizer.pt"), map_location="cpu")
         optimizer.load_state_dict(optimizer_checkpoint["optimizer"])
         scheduler.load_state_dict(optimizer_checkpoint["scheduler"])
         update_step = optimizer_checkpoint["update_step"]
         global_step = optimizer_checkpoint["global_step"]
-        logger.info(f"Optimizer and scheduler restored from {args.continue_from}")
+        logger.info(f"Optimizer and scheduler restored from {_optimizer_dir}")
 
     # global steps and others are defined above
     n_lora_restarts = 0
@@ -498,10 +511,15 @@ def main(args):
             # check optimizer learning rate
             # scheduler should provide a new warmup after the reset
             lr = optimizer.param_groups[0]["lr"]
-            if lr > 1e-6:
+            if lr > 1e-5:
                 alert_message = f"Optimizer lr after the reset is large. This can lead to instability. Current lr is {lr}"
                 logger.warning(alert_message)
-                wandb.alert(title="Learning rate issue", text=alert_message, level=wandb.AlertLevel.WARN)
+                if global_rank == 0:
+                    wandb.alert(
+                        title="Learning rate issue",
+                        text=alert_message,
+                        level=wandb.AlertLevel.WARN,
+                    )
 
             if args.optimizer_random_pruning:
                 logger.info(f"Performing random pruning of optimizer states. Pruning {args.optimizer_random_pruning} percent")
