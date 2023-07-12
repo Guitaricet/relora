@@ -183,6 +183,10 @@ def main(args):
     # turn off logger
     if global_rank != 0: logger.remove()
 
+    # initialize wandb without config (it is passed later)
+    if global_rank == 0:
+        wandb.init(project="peft_pretraining", tags=args.tags)
+
     logger.info(f"Using torch.distributed with rank {global_rank} (only rank 0 will log)")
     logger.info("*" * 40)
     logger.info(f"Starting training with the arguments")
@@ -358,9 +362,9 @@ def main(args):
     trainable_params_names = [name for name, p in model.named_parameters() if p.requires_grad]
 
     # Initialize wandb
-    _config = dict(vars(args))
-    _config["max_lr"] = _config.pop("lr")  # rename lr to max_lr to avoid conflicts with scheduler
-    _config_ext = {
+    run_config = dict(vars(args))
+    run_config.update({
+        "max_lr": run_config.pop("lr"),  # rename lr to max_lr to avoid conflicts with scheduler
         "total_params_M": n_total_params / 1_000_000,
         "trainable_params_M": n_trainable_params / 1_000_000,
         "equivalent_params_M": params_before / 1_000_000,
@@ -370,12 +374,11 @@ def main(args):
         "model": model_config.to_dict(),
         "world_size": world_size,
         "device": str(device),
-    }
-    _config.update(_config_ext)
+    })
 
     if args.use_peft:
         logger.warning("PEFT config (all but lora_r) is hardcoded!")
-        _config["peft_config"] = {
+        run_config["peft_config"] = {
             "r": args.lora_r,
             "alpha": 32,
             "dropout": 0.1,
@@ -383,7 +386,7 @@ def main(args):
         }
 
     if global_rank == 0:
-        wandb.init(project="peft_pretraining", config=_config, tags=args.tags)
+        wandb.config.update(run_config)
         wandb.save(os.path.abspath(__file__), policy="now") # save current script
         # fix tqdm visual length to 80 so that the progress bar
         # doesn't jump around when changing from external display to laptop
@@ -475,7 +478,7 @@ def main(args):
                 "scheduler": scheduler.state_dict(),
                 "update_step": update_step,
                 "global_step": global_step,
-                "config": _config,
+                "config": run_config,
                 "wandb": wandb.run.dir,
                 "dtype": args.dtype,
             }
@@ -609,7 +612,7 @@ def main(args):
             "scheduler": scheduler.state_dict(),
             "update_step": update_step,
             "global_step": global_step,
-            "config": _config,
+            "config": run_config,
             "wandb": wandb.run.dir,
             "dtype": args.dtype,
         }
