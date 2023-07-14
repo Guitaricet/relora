@@ -1,54 +1,68 @@
 # PEFT Pretraining
+> Official code for Stack More Layers Differently: High-Rank Training Through Low-Rank Updates https://arxiv.org/abs/2307.05695
 
 ## Setup
 
-If you are setting the repository on a **new instance**, all you need to do is:
+All requirements are listed in `requirements.txt` and kept up-to-date.
 
 ```bash
-wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O ~/miniconda.sh
-bash miniconda.sh -b
-/root/miniconda3/bin/conda init
-
-bash  # to enable conda
-
 cd peft_pretraining
 pip install -r requirements.txt
-
-wandb login
 ```
 
 ## Usage
 
+To train a model using ReLoRA, first, perform a warmup through regular training.
+
 Train language model with PEFT
 ```bash
-python main.py --model_config configs/llama_1b.json --use_peft --device cuda:0 --lr 0.0005 --batch_size 16
+torchrun --nproc-per-node <N_GPUS> torchrun_main.py \
+    --model_config configs/llama_250m.json \
+    --batch_size 24 \
+    --total_batch_size 1152 \
+    --lr 5e-4 \
+    --max_length 512 \
+    --tags warm_start_250M \
+    --save_every 1000 \
+    --num_training_steps 20000
 ```
+
+> **Reproducibility note:** The way we ran the experiments in the paper was by specifying full num_training_steps, including both the warmup and the ReLoRA training, and stopping it after the desired number of steps was completed. Providing only the number of training steps should work too. The only difference will be the LR schedule during the warmup period.
+
+When you have a warmed-up network checkpoint, run the script with ReLoRA enabled. Note that we use a larger LR during the ReLoRA stage.
 
 Train without PEFT
 ```bash
-python main.py --model_config configs/llama_1b.json --device cuda:0 --lr 0.0005 --batch_size 16
+torchrun --nproc-per-node <N_GPUS> torchrun_main.py \
+    --model_config configs/llama_250m.json \
+    --batch_size 24 \
+    --total_batch_size 1152 \
+    --lr 1e-3 \
+    --max_length 512 \
+    --use_peft \
+    --relora 5000 \
+    --cycle_length 5000 \
+    --restart_warmup_steps 100 \
+    --scheduler cosine_restarts \
+    --warmup_steps 500 \
+    --reset_optimizer_on_relora True \
+    --num_training_steps 20000 \
+    --save_every 5000 \
+    --eval_every 5000 \
+    --continue_from checkpoints/llama_250m-2023-06-09-11-29-56/model_5000 \
+    --tags relora_250M
 ```
 
-Train a larger model
-```bash
-python main.py \
-    --model_config configs/llama_3b.json \
-    --use_peft --train_ln \
-    --device cuda:0 \
-    --lr 0.0005 \
-    --batch_size 16 \
-    --gradient_accumulation 4 \
-    --num_training_steps 50000
-```
+
 
 ## Note on batch sizes
 
-To minimize the pain with multi-GPU setups, we recommend to avoid using `--gradient_accumulation` option directly. Instead specify `--total_batch_size` and allow the script to figure out the gradient accumulation option based on `--batch_size` and the number of GPUs used.
+To minimize the pain with multi-GPU setups, we recommend avoiding using `--gradient_accumulation` option directly. Instead, specify `--total_batch_size` and allow the script to figure out the gradient accumulation option based on `--batch_size` and the number of GPUs used.
 
 ## Relora
 
 Relora integrates existing LoRA parameters into the main network and resets them.
-In principle, such approach can be more flexible than LoRA, but you need to be careful with
+In principle, such an approach can be more flexible than LoRA, but you need to be careful with
 
 1. Optimizer states
 2. Learning rate schedule during and right after the reset
@@ -62,8 +76,11 @@ Optimizer reset options are:
 "--optimizer_magnitude_pruning", default=False, type=float
 ```
 
-We curently support linear and cosine decay learning rate schedulers it is defined by 
-Cosine schedule also supports cyclical mode that repeat the warmup and decay every `--cycle_length` update steps.
+We found that using `--optimizer_magnitude_pruning 0.9` or plain `--reset_optimizer_on_relora` usually performs well.
+Note that `--reset_optimizer_on_relora is True by default` and you need to provide `--reset_optimizer_on_relora False --optimizer_magnitude_pruning 0.9` if you want to do magnitude pruning.
+
+ReLoRA currently only supports cosine decay learning rate scheduler.
+Specifically `cosine_restarts` that works in cyclical mode that repeats the warmup every `--cycle_length` update steps.
 
 ## Warm starts
 
@@ -75,11 +92,10 @@ torchrun torchrun_main.py ... <other options> .. --continue_from checkpoints/lla
 
 ## Distributed training
 
-We support single-node distributed training. For it you can use deepspeed or torchrun.
+We support single-node distributed training using vanilla PyTorch DDP.
+| `main.py` script does not have all features required for relora and will be deleted soon. We recommend to use `torchrun --nproc-per-node 1` for a single-GPU training.
 
-We had some issues with deepspeed and even though it has some nice extra features, we recommend to use torchrun, especially for relora experiments that explode with deepspeed for the reason we coudn't decifer.
-
-Example of using torchrun
+An example of using torchrun
 ```bash
 torchrun --nproc-per-node 8 torchrun_main.py \
     --model_config configs/llama_35m.json \
