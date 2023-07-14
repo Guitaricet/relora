@@ -1,4 +1,4 @@
-# PEFT Pretraining
+# ReLoRA -- PEFT Pretraining
 > Official code for Stack More Layers Differently: High-Rank Training Through Low-Rank Updates https://arxiv.org/abs/2307.05695
 
 ## Setup
