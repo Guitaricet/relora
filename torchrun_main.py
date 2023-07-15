@@ -173,12 +173,20 @@ def initialize_fsdp(model, dtype):
         },
     )
 
-    assert dtype == "bf16", "Only bf16 is supported for now"
-    mixed_precision_policy = MixedPrecision(
-        param_dtype=torch.bfloat16,
-        reduce_dtype=torch.bfloat16,  # Gradient communication precision
-        buffer_dtype=torch.bfloat16,  # Buffer precision
-    )
+    if dtype in ["bf16", "bfloat16"]:
+        mixed_precision_policy = MixedPrecision(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.bfloat16,  # Gradient communication precision
+            buffer_dtype=torch.bfloat16,  # Buffer precision
+        )
+    elif dtype == "float32":
+        mixed_precision_policy = MixedPrecision(
+            param_dtype=torch.float32,
+            reduce_dtype=torch.float32,  # Gradient communication precision
+            buffer_dtype=torch.float32,  # Buffer precision
+        )
+    else:
+        raise ValueError(f"Dtype {dtype} not supported (only float32 and bfloat16 are)")
 
     model = FSDP(
         model,
