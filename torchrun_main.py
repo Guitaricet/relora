@@ -191,7 +191,7 @@ def initialize_fsdp(model, dtype):
     model = FSDP(
         model,
         mixed_precision=mixed_precision_policy,
-        wrapping_policy=wrapping_policy,
+        auto_wrap_policy=wrapping_policy,
     )
     return model
 
