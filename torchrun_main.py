@@ -1,3 +1,10 @@
+"""
+Distributed training code for ReLoRA.
+
+IMPORTANT:
+The number of training steps is assumed to be smaller than the number of batches in the dataset (<= 1 epoch).
+Meaning if provided with 1000000000 steps, it may stop earlier than that if the script run out of data.
+"""
 import os
 import time
 import json
@@ -13,6 +20,12 @@ import torch
 import torch.nn as nn
 import torch.utils.data
 import torch.distributed
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    MixedPrecision,
+    StateDictType,
+)
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
 import transformers
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
@@ -27,7 +40,7 @@ from loguru import logger
 
 from peft_pretraining import training_utils, args_utils
 from peft_pretraining.dataloader import PreprocessedIterableDataset
-from peft_pretraining.modeling_llama import LlamaForCausalLM
+from peft_pretraining.modeling_llama import LlamaForCausalLM, LlamaDecoderLayer
 from peft_pretraining.relora import ReLoRaModel, ReLoRaLinear
 
 transformers.logging.set_verbosity_error()
@@ -70,7 +83,6 @@ def parse_args(args):
                             f"Useful when you want to sync ReLoRA resets with the scheduler for a warmed up model. "
                             f"You need to use it, when your warmup_step % relora_resets != 0")
     parser.add_argument("--min_lr_ratio", type=float, default=0.1)
-    parser.add_argument("--activation_checkpointing", action="store_true")
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--warmup_steps", type=int, default=1_000)
 
@@ -88,6 +100,8 @@ def parse_args(args):
     parser.add_argument("--dtype", type=str, default="bfloat16" if torch.cuda.is_bf16_supported() else "float32")
     parser.add_argument("--workers", type=int, default=8)
 
+    parser.add_argument("--distributed_type", type=str, default="fsdp", choices=["fsdp", "ddp"])
+
     parser.add_argument("--seed", type=int, default=0)
 
     args = parser.parse_args(args)
@@ -99,6 +113,9 @@ def parse_args(args):
                        "This means that you will train with the optimizer from the checkpoint, "
                        "but will not save the optimizer state. "
                        "This is probably not what you want.")
+
+    if args.distributed_type == "fsdp" and args.weight_decay > 0:
+        raise ValueError("FSDP does not support weight decay yet.")
 
     return args
 
@@ -148,11 +165,108 @@ def evaluate_model(model, preprocess_batched, pad_idx, global_rank, world_size, 
     return total_loss, evaluated_on_tokens
 
 
+def initialize_fsdp(model, dtype):
+    wrapping_policy = partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={
+            LlamaDecoderLayer,
+        },
+    )
+
+    assert dtype == "bf16", "Only bf16 is supported for now"
+    mixed_precision_policy = MixedPrecision(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.bfloat16,  # Gradient communication precision
+        buffer_dtype=torch.bfloat16,  # Buffer precision
+    )
+
+    model = FSDP(
+        model,
+        mixed_precision=mixed_precision_policy,
+        wrapping_policy=wrapping_policy,
+    )
+    return model
+
+
+def save_model_ddp(model, optimizer, scheduler, training_state_checkpoint, run_config):
+    global_rank = torch.distributed.get_rank()
+    if global_rank != 0: return
+
+    update_step = training_state_checkpoint["update_step"]
+
+    current_model_directory = f"{args.save_dir}/model_{update_step}"
+    if global_rank == 0:
+        os.makedirs(args.save_dir, exist_ok=True)
+
+    model.module.save_pretrained(current_model_directory)
+    optimizer_checkpoint = {
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "update_step": update_step,
+        "global_step": training_state_checkpoint["global_step"],
+        "config": run_config,
+        "wandb": wandb.run.dir,
+        "dtype": args.dtype,
+    }
+    torch.save(optimizer_checkpoint, f"{current_model_directory}/optimizer.pt")
+
+    with open(f"{current_model_directory}/training_state.json", "w") as f:
+        json.dump(training_state_checkpoint, f, indent=4)
+
+
+def save_model_fsdp(model, optimizer, scheduler, training_state_checkpoint, run_config):
+    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
+        global_rank = torch.distributed.get_rank()
+        update_step = training_state_checkpoint["update_step"]
+
+        current_model_directory = f"{args.save_dir}/model_{update_step}"
+        if global_rank == 0:
+            os.makedirs(args.save_dir, exist_ok=True)
+
+        model.module.save_pretrained(current_model_directory)
+
+        if global_rank == 0:
+            optimizer_checkpoint = {
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "update_step": update_step,
+                "global_step": training_state_checkpoint["global_step"],
+                "config": run_config,
+                "wandb": wandb.run.dir,
+                "dtype": args.dtype,
+            }
+            torch.save(optimizer_checkpoint, f"{current_model_directory}/optimizer.pt")
+
+            with open(f"{current_model_directory}/training_state.json", "w") as f:
+                json.dump(training_state_checkpoint, f, indent=4)
+
+
+def save_model(model, *, optimizer, scheduler, training_state_checkpoint, run_config, distributed_type):
+    """
+    Args:
+        training_state_checkpoint: dict with keys:
+            global_step: int
+            update_step: int
+            tokens_seen: int
+            tokens_seen_before: int
+            n_lora_restarts: int
+            update_time: float
+        run_config: 
+    """
+    if distributed_type == "ddp":
+        save_model_ddp(model, optimizer, scheduler, training_state_checkpoint, run_config)
+    elif distributed_type == "fsdp":
+        save_model_fsdp(model, optimizer, scheduler, training_state_checkpoint, run_config)
+    else:
+        raise ValueError(f"Unknown distributed type {distributed_type}")
+
+
 def main(args):
     # seed all
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     random.seed(args.seed)
+    using_fsdp = args.distributed_type == "fsdp"
 
     assert "LOCAL_RANK" in os.environ, "torchrun should set LOCAL_RANK"
     args.local_rank = int(os.environ["LOCAL_RANK"])
@@ -169,6 +283,7 @@ def main(args):
     global_rank = torch.distributed.get_rank()
     local_rank = global_rank % torch.cuda.device_count()
     world_size = torch.distributed.get_world_size()
+    torch.cuda.set_device(local_rank)
     device = f"cuda:{local_rank}"
 
     if args.total_batch_size is not None:
@@ -235,9 +350,6 @@ def main(args):
     else:
         model = LlamaForCausalLM(model_config)
 
-    if args.activation_checkpointing:
-        model.gradient_checkpointing_enable()
-
     global_step = 0
     update_step = 0
     tokens_seen = 0
@@ -303,7 +415,7 @@ def main(args):
                 param.requires_grad = True
             else:
                 param.requires_grad = False
-    
+
     if args.continue_from_peft:
         logger.info(f"Loading model from {args.continue_from_peft}")
         checkpoint_path = os.path.join(args.continue_from_peft, "pytorch_model.bin")
@@ -346,12 +458,19 @@ def main(args):
     else:
         model = model.to(device=device)
 
-    model: Union[ReLoRaModel, LlamaForCausalLM] = torch.nn.parallel.DistributedDataParallel(
-        model,
-        device_ids=[args.local_rank],
-        output_device=args.local_rank,
-        broadcast_buffers=False,
-    )
+    if args.distributed_type == "fsdp":
+        logger.info("Wrapping model with FSDP")
+        assert using_fsdp
+        model: Union[FSDP, ReLoRaModel, LlamaForCausalLM] = initialize_fsdp(model, dtype=args.dtype)
+
+    elif args.distributed_type == "ddp":
+        logger.info("Wrapping model with DDP")
+        model: Union[ReLoRaModel, LlamaForCausalLM] = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[args.local_rank],
+            output_device=args.local_rank,
+            broadcast_buffers=False,
+        )
 
     n_total_params = sum(p.numel() for p in model.parameters())
     n_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -467,23 +586,8 @@ def main(args):
         update_step += 1
         update_time = time.time() - update_time
 
-        if local_step > args.gradient_accumulation and update_step % args.save_every == 0 and global_rank == 0:
-            current_model_directory = f"{args.save_dir}/model_{update_step}"
+        if local_step > args.gradient_accumulation and update_step % args.save_every == 0:
             logger.info(f"Saving model and optimizer to {current_model_directory}, update step {update_step}")
-            os.makedirs(args.save_dir, exist_ok=True)
-            model.module.save_pretrained(current_model_directory)
-
-            optimizer_checkpoint = {
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "update_step": update_step,
-                "global_step": global_step,
-                "config": run_config,
-                "wandb": wandb.run.dir,
-                "dtype": args.dtype,
-            }
-            torch.save(optimizer_checkpoint, f"{current_model_directory}/optimizer.pt")
-
             training_state_checkpoint = {
                 "global_step": global_step,
                 "update_step": update_step,
@@ -492,8 +596,14 @@ def main(args):
                 "n_lora_restarts": n_lora_restarts,
                 "update_time": update_time,
             }
-            with open(f"{current_model_directory}/training_state.json", "w") as f:
-                json.dump(training_state_checkpoint, f, indent=4)
+            save_model(
+                model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                training_state_checkpoint=training_state_checkpoint,
+                run_config=run_config,
+                distributed_type=args.distributed_type,
+            )
 
         # restart model after we modify the learning rate, so on the next step after the relora frequency
         can_reset = args.continue_from_peft is not None \
@@ -602,22 +712,8 @@ def main(args):
     if global_rank == 0: pbar.close()
 
     current_model_directory = f"{args.save_dir}/model_{update_step}"
-    if global_rank == 0 and not os.path.exists(current_model_directory):
+    if not os.path.exists(current_model_directory):
         logger.info(f"Saving model and optimizer to {current_model_directory}, update step {update_step}")
-        os.makedirs(args.save_dir, exist_ok=True)
-        model.module.save_pretrained(current_model_directory)
-
-        optimizer_checkpoint = {
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "update_step": update_step,
-            "global_step": global_step,
-            "config": run_config,
-            "wandb": wandb.run.dir,
-            "dtype": args.dtype,
-        }
-        torch.save(optimizer_checkpoint, f"{current_model_directory}/optimizer.pt")
-
         training_state_checkpoint = {
             "global_step": global_step,
             "update_step": update_step,
@@ -626,8 +722,14 @@ def main(args):
             "n_lora_restarts": n_lora_restarts,
             "update_time": update_time,
         }
-        with open(f"{current_model_directory}/training_state.json", "w") as f:
-            json.dump(training_state_checkpoint, f, indent=4)
+        save_model(
+            model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            training_state_checkpoint=training_state_checkpoint,
+            run_config=run_config,
+            distributed_type=args.distributed_type,
+        )
 
     # Final evaluation
     logger.info("Running final evaluation")
