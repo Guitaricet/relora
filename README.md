@@ -1,5 +1,6 @@
 # ReLoRA -- PEFT Pretraining
 > Official code for Stack More Layers Differently: High-Rank Training Through Low-Rank Updates https://arxiv.org/abs/2307.05695
+<img width="813" alt="ReLoRA" src="https://github.com/Guitaricet/peft_pretraining/assets/2821124/41415bd0-b39f-4f2c-9bbd-5fd6555e87a7">
 
 ## Setup
 
