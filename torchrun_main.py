@@ -19,7 +19,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.utils.data
-import torch.distributed
+import torch.distributed as dist
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
     MixedPrecision,
@@ -86,7 +86,7 @@ def parse_args(args):
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--warmup_steps", type=int, default=1_000)
 
-    parser.add_argument("--eval_every", type=int, default=5_000)
+    parser.add_argument("--eval_every", type=int, default=1_000)
 
     parser.add_argument("--num_training_steps", type=int, default=10_000,
                         help="Number of **update steps** to train for. "
@@ -121,11 +121,13 @@ def parse_args(args):
 
 
 @torch.no_grad()
-def evaluate_model(model, preprocess_batched, pad_idx, global_rank, world_size, device, batch_size):
+def evaluate_model(model, preprocess_batched, pad_idx, device, batch_size):
+    global_rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
     _time = time.time()
     val_data = datasets.load_dataset("c4", "en", split="validation", streaming=True)
     val_data = val_data.shuffle(seed=42)
-    logger.info(f"Loaded validation dataset in {time.time() - _time:.2f} seconds")
 
     val_data = datasets.distributed.split_dataset_by_node(val_data, rank=global_rank, world_size=world_size)
 
@@ -137,32 +139,38 @@ def evaluate_model(model, preprocess_batched, pad_idx, global_rank, world_size, 
     val_data_mapped.batch = lambda batch_size: training_utils.batch_fn(val_data_mapped, batch_size)
 
     target_eval_tokens = 10_000_000
-    evaluated_on_tokens = 0
-    total_loss = torch.tensor(0.0).to(device)
-    total_batches = 1
-    logger.info(f"Eval set prepared in {time.time() - _time:.2f} seconds")
+    ddp_loss_info = torch.zeros(2).to(device)  # [loss, n_tokens]
+    tokens_in_batch_info = torch.zeros(1).to(device)
 
-    for batch in val_data_mapped.batch(batch_size=batch_size):
-        if evaluated_on_tokens > target_eval_tokens:
-            break
-        total_batches += 1
+    logger.info(f"Eval set prepared in {time.time() - _time:.2f} seconds")
+    for i, batch in enumerate(val_data_mapped.batch(batch_size=batch_size)):
+        if i == 0:
+            # this way of estiming the number of eval steps
+            # is needed to avoid a deadlock when using FSDP 
+            tokens_in_batch_info[0] += (batch["input_ids"] != pad_idx).sum().item()
+            dist.all_reduce(tokens_in_batch_info, op=dist.ReduceOp.SUM)
+            n_eval_iters = int(target_eval_tokens / tokens_in_batch_info[0])
+
+        if i > n_eval_iters: break
 
         batch = {k: v.to(device) for k, v in batch.items()}
         labels = batch["input_ids"].clone()
         labels[labels == pad_idx] = -100
         loss = model(**batch, labels=labels).loss
-        total_loss += loss.detach()
 
-        evaluated_on_tokens += (batch["input_ids"] != pad_idx).sum().item() * world_size
-
-    total_loss = total_loss / total_batches
+        tokens_in_batch = (batch["input_ids"] != pad_idx).sum().item()
+        ddp_loss_info[0] += loss.detach()
+        ddp_loss_info[1] += tokens_in_batch
 
     # Gather losses across all GPUs
-    gathered_losses = [torch.zeros_like(total_loss) for _ in range(world_size)]
-    torch.distributed.all_gather(gathered_losses, total_loss)
-    total_loss = sum([t.item() for t in gathered_losses]) / world_size
+    dist.all_reduce(ddp_loss_info, op=dist.ReduceOp.SUM)
+    eval_loss = ddp_loss_info[0] / ddp_loss_info[1]
+    evaluated_on_tokens = ddp_loss_info[1].item()
+    logger.info(f"Evaluated on {evaluated_on_tokens} tokens, eval loss: {eval_loss:.4f}")
 
-    return total_loss, evaluated_on_tokens
+    logger.info(f"Evaluation took {time.time() - _time:.2f} seconds")
+
+    return eval_loss, evaluated_on_tokens
 
 
 def initialize_fsdp(model, dtype):
@@ -196,17 +204,16 @@ def initialize_fsdp(model, dtype):
     return model
 
 
-def save_model_ddp(model, optimizer, scheduler, training_state_checkpoint, run_config):
-    global_rank = torch.distributed.get_rank()
+def save_model_ddp(model, optimizer, scheduler, training_state_checkpoint, run_config, save_dir):
+    global_rank = dist.get_rank()
     if global_rank != 0: return
 
     update_step = training_state_checkpoint["update_step"]
 
-    current_model_directory = f"{args.save_dir}/model_{update_step}"
     if global_rank == 0:
-        os.makedirs(args.save_dir, exist_ok=True)
+        os.makedirs(os.path.dirname(save_dir), exist_ok=True)
 
-    model.module.save_pretrained(current_model_directory)
+    model.module.save_pretrained(save_dir)
     optimizer_checkpoint = {
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
@@ -216,22 +223,21 @@ def save_model_ddp(model, optimizer, scheduler, training_state_checkpoint, run_c
         "wandb": wandb.run.dir,
         "dtype": args.dtype,
     }
-    torch.save(optimizer_checkpoint, f"{current_model_directory}/optimizer.pt")
+    torch.save(optimizer_checkpoint, f"{save_dir}/optimizer.pt")
 
-    with open(f"{current_model_directory}/training_state.json", "w") as f:
+    with open(f"{save_dir}/training_state.json", "w") as f:
         json.dump(training_state_checkpoint, f, indent=4)
 
 
-def save_model_fsdp(model, optimizer, scheduler, training_state_checkpoint, run_config):
+def save_model_fsdp(model, optimizer, scheduler, training_state_checkpoint, run_config, save_dir):
     with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
-        global_rank = torch.distributed.get_rank()
+        global_rank = dist.get_rank()
         update_step = training_state_checkpoint["update_step"]
 
-        current_model_directory = f"{args.save_dir}/model_{update_step}"
         if global_rank == 0:
-            os.makedirs(args.save_dir, exist_ok=True)
+            os.makedirs(os.path.dirname(save_dir), exist_ok=True)
 
-        model.module.save_pretrained(current_model_directory)
+        model.module.save_pretrained(save_dir)
 
         if global_rank == 0:
             optimizer_checkpoint = {
@@ -243,13 +249,13 @@ def save_model_fsdp(model, optimizer, scheduler, training_state_checkpoint, run_
                 "wandb": wandb.run.dir,
                 "dtype": args.dtype,
             }
-            torch.save(optimizer_checkpoint, f"{current_model_directory}/optimizer.pt")
+            torch.save(optimizer_checkpoint, f"{save_dir}/optimizer.pt")
 
-            with open(f"{current_model_directory}/training_state.json", "w") as f:
+            with open(f"{save_dir}/training_state.json", "w") as f:
                 json.dump(training_state_checkpoint, f, indent=4)
 
 
-def save_model(model, *, optimizer, scheduler, training_state_checkpoint, run_config, distributed_type):
+def save_model(model, *, optimizer, scheduler, training_state_checkpoint, run_config, distributed_type, save_dir):
     """
     Args:
         training_state_checkpoint: dict with keys:
@@ -262,9 +268,9 @@ def save_model(model, *, optimizer, scheduler, training_state_checkpoint, run_co
         run_config: 
     """
     if distributed_type == "ddp":
-        save_model_ddp(model, optimizer, scheduler, training_state_checkpoint, run_config)
+        save_model_ddp(model, optimizer, scheduler, training_state_checkpoint, run_config, save_dir)
     elif distributed_type == "fsdp":
-        save_model_fsdp(model, optimizer, scheduler, training_state_checkpoint, run_config)
+        save_model_fsdp(model, optimizer, scheduler, training_state_checkpoint, run_config, save_dir)
     else:
         raise ValueError(f"Unknown distributed type {distributed_type}")
 
@@ -282,15 +288,15 @@ def main(args):
     print(f"local rank: {args.local_rank}, device: {torch.cuda.current_device()}")
 
     # assumes that we are using a single node
-    torch.distributed.init_process_group(
+    dist.init_process_group(
         backend="nccl",
         rank=args.local_rank,
         world_size=torch.cuda.device_count()
     )
 
-    global_rank = torch.distributed.get_rank()
+    global_rank = dist.get_rank()
     local_rank = global_rank % torch.cuda.device_count()
-    world_size = torch.distributed.get_world_size()
+    world_size = dist.get_world_size()
     torch.cuda.set_device(local_rank)
     device = f"cuda:{local_rank}"
 
@@ -302,6 +308,10 @@ def main(args):
 
     assert args.gradient_accumulation * args.batch_size * world_size == args.total_batch_size, \
         "gradient_accumulation * batch_size * world_size must be equal to total_batch_size"
+
+    if args.max_train_tokens is not None:
+        args.num_training_steps = args.max_train_tokens // args.total_batch_size
+        logger.info(f"Setting num_training_steps to {args.num_training_steps} based on max_train_tokens")
 
     # turn off logger
     if global_rank != 0: logger.remove()
@@ -595,6 +605,7 @@ def main(args):
         update_time = time.time() - update_time
 
         if local_step > args.gradient_accumulation and update_step % args.save_every == 0:
+            current_model_directory = f"{args.save_dir}/model_{update_step}"
             logger.info(f"Saving model and optimizer to {current_model_directory}, update step {update_step}")
             training_state_checkpoint = {
                 "global_step": global_step,
@@ -611,6 +622,7 @@ def main(args):
                 training_state_checkpoint=training_state_checkpoint,
                 run_config=run_config,
                 distributed_type=args.distributed_type,
+                save_dir=current_model_directory,
             )
 
         # restart model after we modify the learning rate, so on the next step after the relora frequency
@@ -676,8 +688,9 @@ def main(args):
         if update_step % args.eval_every == 0:
             logger.info(f"Performing evaluation at step {update_step}")
             total_loss, evaluated_on_tokens = evaluate_model(
-                model, preprocess_batched, pad_idx, global_rank, world_size, device, args.batch_size
+                model, preprocess_batched, pad_idx, device, args.batch_size
             )
+
             if global_rank == 0:
                 wandb.log({
                     "final_eval_loss": total_loss,
@@ -712,6 +725,8 @@ def main(args):
                         all_scaling_factors.append(module.scaling.data.item())
                 wandb.log({"lora_scaling": torch.tensor(all_scaling_factors)}, step=global_step)
         update_time = time.time()
+    else: # for-else statement
+        logger.warning("Reached the end of the dataset. Training stopped")
 
     # ##############################
     # END of training loop
@@ -737,6 +752,7 @@ def main(args):
             training_state_checkpoint=training_state_checkpoint,
             run_config=run_config,
             distributed_type=args.distributed_type,
+            save_dir=args.save_dir,
         )
 
     # Final evaluation
@@ -747,7 +763,7 @@ def main(args):
     torch.cuda.empty_cache()
 
     total_loss, evaluated_on_tokens = evaluate_model(
-        model, preprocess_batched, pad_idx, global_rank, world_size, device, args.batch_size
+        model, preprocess_batched, pad_idx, device, args.batch_size
     )
 
     if global_rank == 0:
