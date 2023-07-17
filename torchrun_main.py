@@ -41,7 +41,7 @@ from loguru import logger
 from peft_pretraining import training_utils, args_utils
 from peft_pretraining.dataloader import PreprocessedIterableDataset
 from peft_pretraining.modeling_llama import LlamaForCausalLM, LlamaDecoderLayer
-from peft_pretraining.relora import ReLoRaModel, ReLoRaLinear
+from peft_pretraining.relora import ReLoRaModel, ReLoRaLinear, merge_and_reinit_functional
 
 transformers.logging.set_verbosity_error()
 
@@ -376,7 +376,7 @@ def main(args):
     if args.continue_from is not None:
         logger.info("*" * 40)
         logger.info(f"Loading model from {args.continue_from}")
-        checkpoint_path = os.path.join(args.continue_from, "pytorch_model.bin")
+        checkpoint_path = os.path.join(args.continue_from, "pytorch_model.bin")  # !! won't work with sharded models
         model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"), strict=True)
         logger.info(f"Model successfully loaded (strict=True policy)")
 
@@ -465,9 +465,6 @@ def main(args):
     logger.info(f"Saving model to {args.save_dir} every {args.save_every} update steps")
 
     if args.use_peft and args.relora is not None:
-        if (params_after <= params_before):
-            raise ValueError("Total number of parameters should increase after applying LoRA with restarts")
-        
         if (trainable_after >= trainable_before):
             raise ValueError("Total number of trainable parameters should decrease after applying LoRA with restarts")
 
@@ -632,19 +629,25 @@ def main(args):
         if can_reset and update_step % args.relora == 1:
             logger.info(f"Performing lora reset. Current lr is {optimizer.param_groups[0]['lr']}")
             n_lora_restarts += 1
-            model.module.merge_and_reinit()
+
+            if args.distributed_type == "ddp":
+                model.module.merge_and_reinit()
+            elif args.distributed_type == "fsdp":
+                model.apply(merge_and_reinit_functional)
+            else:
+                raise ValueError(f"Unknown distributed type {args.distributed_type}")
 
             if args.reset_optimizer_on_relora:
                 logger.info("Resetting optimizer states to zeros")
                 for p in lora_params:
                     param_state = optimizer.state[p]
                     for key in optimizer_state_keys:
-                        param_state[key] = torch.zeros_like(p.data)
-            
+                        param_state[key] = torch.zeros_like(param_state[key])
+
             # check optimizer learning rate
             # scheduler should provide a new warmup after the reset
             lr = optimizer.param_groups[0]["lr"]
-            if lr > 1e-5:
+            if lr > 1e-4:
                 alert_message = f"Optimizer lr after the reset is large. This can lead to instability. Current lr is {lr}"
                 logger.warning(alert_message)
                 if global_rank == 0:
