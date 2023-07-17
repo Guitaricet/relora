@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from transformers import AutoModelForCausalLM, LlamaForCausalLM, AutoConfig
+from transformers import AutoModelForCausalLM, AutoConfig
 
 
 @dataclass
@@ -31,8 +31,7 @@ def merge_and_reinit_functional(module):
     module.weight.data += _delta
     module.merged = False
     nn.init.kaiming_uniform_(module.lora_A.weight, a=math.sqrt(5))
-    # print("WARNING: HARD-CODED INITIALIZZATION")
-    # nn.init.uniform_(self.lora_A.weight, 1e-7)
+
     nn.init.zeros_(module.lora_B.weight)
     if module.trainable_scaling:
         nn.init.zeros_(module.scaling)
@@ -221,8 +220,7 @@ class ReLoRaLinear(nn.Linear):
         self.weight.data += self.lora_B.weight @ self.lora_A.weight * self._post_lora_scale()
         self.merged = False
         nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
-        # print("WARNING: HARD-CODED INITIALIZZATION")
-        # nn.init.uniform_(self.lora_A.weight, 1e-7)
+
         nn.init.zeros_(self.lora_B.weight)
         if self.trainable_scaling:
             nn.init.zeros_(self.scaling)
