@@ -51,9 +51,12 @@ def parse_args(args):
 
     parser.add_argument("--model_config", type=str, required=True)
     parser.add_argument("--use_hf_model", default=False, action="store_true")
-    parser.add_argument("--continue_from", type=str, default=None)
+    parser.add_argument("--continue_from", type=str, default=None, help="Start with warmed-up model weights")
     parser.add_argument("--continue_from_peft", type=str, default=None, help="Continue training with ReLoRA, loading optimizer and scheduler from the checkpoint.")
     parser.add_argument("--restore_optimizer", default=False, action="store_true")
+
+    parser.add_argument("--dataset", type=str, default="c4,en", help="Huggingface dataset name,split (split is optional)")
+    parser.add_argument("--streaming_dataset", default=True, type=lambda x: x.lower() == "true")
 
     parser.add_argument("--batch_size", type=int, required=True)
     parser.add_argument("--gradient_accumulation", type=int, default=None)
@@ -117,6 +120,8 @@ def parse_args(args):
     if args.distributed_type == "fsdp" and args.weight_decay > 0:
         raise ValueError("FSDP does not support weight decay yet.")
 
+    args.dataset = args.dataset.split(",")
+
     return args
 
 
@@ -126,7 +131,8 @@ def evaluate_model(model, preprocess_batched, pad_idx, device, batch_size):
     world_size = dist.get_world_size()
 
     _time = time.time()
-    val_data = datasets.load_dataset("c4", "en", split="validation", streaming=True)
+
+    val_data = datasets.load_dataset(*args.dataset, split="validation", streaming=True)
     val_data = val_data.shuffle(seed=42)
 
     val_data = datasets.distributed.split_dataset_by_node(val_data, rank=global_rank, world_size=world_size)
@@ -327,9 +333,8 @@ def main(args):
         logger.info(f"{k:30} {v}")
     logger.info("*" * 40)
 
-    dataset_name = "c4"
-    assert dataset_name == "c4"
-    data = datasets.load_dataset("c4", "en", split="train", streaming=True)
+    # args.dataset can look like this: "[c4, en]", this is why we use the star
+    data = datasets.load_dataset(*args.dataset, split="train", streaming=args.streaming_dataset)
 
     # this seed is hard-coded to guarantee the same order of the examples (for any --seed)
     seed_for_shuffle = 42
@@ -504,7 +509,6 @@ def main(args):
         "equivalent_params_M": params_before / 1_000_000,
         "percent_trainable_params": p_trainable_params,
         "name_trainable_params": trainable_params_names,
-        "dataset": dataset_name,
         "model": model_config.to_dict(),
         "world_size": world_size,
         "device": str(device),
