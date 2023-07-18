@@ -40,8 +40,7 @@ import wandb
 from tqdm import tqdm
 from loguru import logger
 
-from peft_pretraining import training_utils, args_utils
-from peft_pretraining.dataloader import PreprocessedIterableDataset, tokenize_and_chunk
+from peft_pretraining import training_utils, args_utils, megatron_dataloader
 from peft_pretraining.modeling_llama import LlamaForCausalLM, LlamaDecoderLayer
 from peft_pretraining.relora import ReLoRaModel, ReLoRaLinear, merge_and_reinit_functional
 
@@ -365,8 +364,9 @@ def main(args):
         )
         return batch
 
-    dataset = tokenize_and_chunk(tokenizer, data, text_field="text", sequence_length=args.max_length, num_cpu=args.workers)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, num_workers=args.workers)
+    dataloader, _, _ = megatron_dataloader.build_train_valid_test_data_iterators(
+        neox_args=neox_args,
+    )
 
     model_config = AutoConfig.from_pretrained(args.model_config)
     if args.use_hf_model:

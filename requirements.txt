@@ -8,3 +8,4 @@ loguru
 nvitop
 lion-pytorch
 matplotlib
+pybind11
