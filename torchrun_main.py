@@ -22,6 +22,8 @@ import torch.utils.data
 import torch.distributed as dist
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
+    FullStateDictConfig,
+    ShardedStateDictConfig,
     MixedPrecision,
     StateDictType,
 )
@@ -39,7 +41,7 @@ from tqdm import tqdm
 from loguru import logger
 
 from peft_pretraining import training_utils, args_utils
-from peft_pretraining.dataloader import PreprocessedIterableDataset
+from peft_pretraining.dataloader import PreprocessedIterableDataset, tokenize_and_chunk
 from peft_pretraining.modeling_llama import LlamaForCausalLM, LlamaDecoderLayer
 from peft_pretraining.relora import ReLoRaModel, ReLoRaLinear, merge_and_reinit_functional
 
@@ -286,7 +288,6 @@ def main(args):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     random.seed(args.seed)
-    using_fsdp = args.distributed_type == "fsdp"
 
     assert "LOCAL_RANK" in os.environ, "torchrun should set LOCAL_RANK"
     args.local_rank = int(os.environ["LOCAL_RANK"])
@@ -364,8 +365,8 @@ def main(args):
         )
         return batch
 
-    dataset = PreprocessedIterableDataset(data, tokenizer, batch_size=args.batch_size, max_length=args.max_length)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=None, num_workers=args.workers)
+    dataset = tokenize_and_chunk(tokenizer, data, text_field="text", sequence_length=args.max_length, num_cpu=args.workers)
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, num_workers=args.workers)
 
     model_config = AutoConfig.from_pretrained(args.model_config)
     if args.use_hf_model:
@@ -403,7 +404,6 @@ def main(args):
         logger.info("*" * 40)
 
     params_before = sum(p.numel() for p in model.parameters())
-    trainable_before = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     if args.use_peft:
         for p in model.parameters():
@@ -459,7 +459,6 @@ def main(args):
         logger.info(f"Will train for {args.num_training_steps - update_step} update steps")
 
     params_after = sum(p.numel() for p in model.parameters())
-    trainable_after = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     # print params and trainable params
     logger.info(f"\n{model}\n")
@@ -469,10 +468,6 @@ def main(args):
 
     logger.info(f"Saving model to {args.save_dir} every {args.save_every} update steps")
 
-    if args.use_peft and args.relora is not None:
-        if (trainable_after >= trainable_before):
-            raise ValueError("Total number of trainable parameters should decrease after applying LoRA with restarts")
-
     if args.dtype in ["bf16", "bfloat16"]:
         model = model.to(device=device, dtype=torch.bfloat16)
     else:
@@ -480,7 +475,6 @@ def main(args):
 
     if args.distributed_type == "fsdp":
         logger.info("Wrapping model with FSDP")
-        assert using_fsdp
         model: Union[FSDP, ReLoRaModel, LlamaForCausalLM] = initialize_fsdp(model, dtype=args.dtype)
 
     elif args.distributed_type == "ddp":
@@ -489,8 +483,36 @@ def main(args):
             model,
             device_ids=[args.local_rank],
             output_device=args.local_rank,
-            broadcast_buffers=False,
         )
+
+    if False and args.distributed_type == "fsdp":  # only for debug
+        logger.info("************************* FSDP device placement *************************")
+        for state_dict_type, state_dict_config in [
+            (StateDictType.FULL_STATE_DICT, FullStateDictConfig()),
+            # (StateDictType.LOCAL_STATE_DICT, LocalStateDictConfig(offload_to_cpu=True)),
+            (StateDictType.SHARDED_STATE_DICT, ShardedStateDictConfig()),
+        ]:
+            with FSDP.state_dict_type(
+                model, state_dict_type, state_dict_config,
+            ):
+                state_dict = model.state_dict()
+                if local_rank == 0:
+                    for k in list(state_dict.keys())[:10]:
+                        tensor = state_dict[k]
+                        if hasattr(tensor, "local_tensor"):
+                            print("Local tensor on rank ", local_rank, ". ", state_dict_type, k, f"F={tensor.shape}, L={tensor.local_tensor().shape}" , type(tensor))
+                        else:
+                            print(state_dict_type, k, tensor.shape, type(tensor))
+                elif local_rank == 1:
+                    time.sleep(2)
+                    for k in list(state_dict.keys())[:10]:
+                        tensor = state_dict[k]
+                        if hasattr(tensor, "local_tensor"):
+                            print("Local tensor on rank ", local_rank, ". ", state_dict_type, k, f"F={tensor.shape}, L={tensor.local_tensor().shape}" , type(tensor))
+                        else:
+                            print(state_dict_type, k, tensor.shape, type(tensor))
+        time.sleep(10)
+        logger.info("********************* end of FSDP device placement ***********************")
 
     n_total_params = sum(p.numel() for p in model.parameters())
     n_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
