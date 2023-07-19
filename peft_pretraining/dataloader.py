@@ -3,9 +3,11 @@ import multiprocessing
 from itertools import chain
 
 import torch
-from torch.utils.data import IterableDataset, get_worker_info
+from torch.utils.data import BatchSampler, DataLoader, IterableDataset, get_worker_info
 from transformers import AutoTokenizer, default_data_collator
 from datasets import Dataset
+
+from loguru import logger
 
 
 class PreprocessedIterableDataset(IterableDataset):
@@ -75,12 +77,17 @@ def tokenize_and_chunk(
     if isinstance(dataset, IterableDataset):
         extra_map_kwargs = {}
 
+    # check that text_field is in dataset
     tokenized_dataset = dataset.map(
         lambda example: tokenizer([t + tokenizer.eos_token for t in example[text_field]]),
         batched=True,
         remove_columns=[text_field],
         **extra_map_kwargs,
     )
+    assert "input_ids" in tokenized_dataset["train"].features
+    assert len(tokenized_dataset["train"]) > 0
+    logger.info(f"Tokenization finished")
+    logger.info(f"\n{tokenized_dataset}")
 
     block_size = sequence_length
 
@@ -105,5 +112,53 @@ def tokenize_and_chunk(
         batched=True,
         **extra_map_kwargs,
     )
+    logger.info(f"Chunking finished")
+    logger.info(f"\n{train_dataset}")
 
     return train_dataset
+
+
+# from https://github.com/huggingface/accelerate/blob/8514c35192ac9762920f1ab052e5cea4c0e46eeb/src/accelerate/data_loader.py#L816
+class SkipBatchSampler(BatchSampler):
+    """
+    A `torch.utils.data.BatchSampler` that skips the first `n` batches of another `torch.utils.data.BatchSampler`.
+    """
+
+    def __init__(self, batch_sampler, skip_batches=0):
+        self.batch_sampler = batch_sampler
+        self.skip_batches = skip_batches
+
+    def __iter__(self):
+        for index, samples in enumerate(self.batch_sampler):
+            if index >= self.skip_batches:
+                yield samples
+
+    @property
+    def total_length(self):
+        return len(self.batch_sampler)
+
+    def __len__(self):
+        return len(self.batch_sampler) - self.skip_batches
+
+
+class SkipDataLoader(DataLoader):
+    """
+    Subclass of a PyTorch `DataLoader` that will skip the first batches.
+
+    Args:
+        dataset (`torch.utils.data.dataset.Dataset`):
+            The dataset to use to build this datalaoder.
+        skip_batches (`int`, *optional*, defaults to 0):
+            The number of batches to skip at the beginning.
+        kwargs:
+            All other keyword arguments to pass to the regular `DataLoader` initialization.
+    """
+
+    def __init__(self, dataset, skip_batches=0, **kwargs):
+        super().__init__(dataset, **kwargs)
+        self.skip_batches = skip_batches
+
+    def __iter__(self):
+        for index, batch in enumerate(super().__iter__()):
+            if index >= self.skip_batches:
+                yield batch

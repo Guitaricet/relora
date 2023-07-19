@@ -7,33 +7,35 @@ Usage:
 """
 import os
 import time
+import json
 import argparse
 import multiprocessing
-from itertools import chain
 
 from loguru import logger
-from datasets import Dataset, load_dataset
+from datasets import load_dataset
 from transformers import AutoTokenizer
 
 
 from peft_pretraining.dataloader import tokenize_and_chunk
 
 
-def parse_args(args):
+def parse_args(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--tokenizer", type=str, required=True, help="HuggingFace tokenizer name")
-    parser.add_argument("--dataset", type=str, required=True, help="HuggingFace dataset name")
+    parser.add_argument("--dataset", type=str, required=True, help="HuggingFace dataset name. E.g., wikitext")
+    parser.add_argument("--dataset_config", type=str, default=None, help="HuggingFace dataset config name. E.g., wikitext-2-v1")
     parser.add_argument("--text_field", type=str, default="text", help="Name of the text field in the dataset")
     parser.add_argument("--sequence_length", type=int, default=2048, help="Sequence length")
     parser.add_argument("--num_cpu", type=int, default=multiprocessing.cpu_count(), help="Number of CPU cores")
-    parser.add_argument("--limit", type=int, default=None, help="Limit the number of examples in the dataset")
     parser.add_argument("--save_dir", type=str, required=True, help="Directory to save the pre-tokenized dataset")
 
     args = parser.parse_args(args)
+
     return args
 
 
 def main(args):
+    print("In main")
     logger.info("*" * 40)
     logger.info(f"Starting script with the arguments")
     for k, v in vars(args).items():
@@ -41,16 +43,12 @@ def main(args):
     logger.info("*" * 40)
 
     _tokenizer_name_for_save = args.tokenizer.replace("/", "_")
-    save_path = os.path.join(args.save_dir, f"{args.dataset}_{_tokenizer_name_for_save}_{args.sequence_length}")
+    save_path = os.path.join(args.save_dir, f"{args.dataset}_{args.dataset_config}_{_tokenizer_name_for_save}_{args.sequence_length}")
     if os.path.exists(save_path):
         raise ValueError(f"Path {save_path} already exists")
 
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer)
-    dataset = load_dataset(dataset, split="train")
-
-    if args.limit is not None:
-        logger.info(f"Limiting the dataset to {args.limit} examples")
-        dataset = dataset.select(range(args.limit))
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+    dataset = load_dataset(args.dataset, args.dataset_config)
 
     logger.info("Tokenizing and chunking the dataset")
     _time = time.time()
@@ -65,8 +63,15 @@ def main(args):
     logger.info(f"Tokenization and chunking took {_hours:.2f} hours")
 
     dataset.save_to_disk(save_path)
+    logger.info(f"Saved the dataset to {save_path}")
+
+    with open(os.path.join(save_path, "args.json"), "w") as f:
+        json.dump(vars(args), f, indent=4)
+    print("In main")
 
 
 if __name__ == "__main__":
+    print("Starting the script")
     args = parse_args()
     main(args)
+

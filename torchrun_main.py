@@ -9,7 +9,6 @@ import os
 import time
 import json
 import random
-import hashlib
 import argparse
 from typing import Union
 from functools import partial
@@ -30,8 +29,7 @@ from torch.distributed.fsdp import (
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
 import transformers
-from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
-from transformers import LlamaForCausalLM as HF_LlamaForCausalLM
+from transformers import AutoConfig, AutoTokenizer, default_data_collator
 
 import datasets
 import datasets.distributed
@@ -41,24 +39,23 @@ from tqdm import tqdm
 from loguru import logger
 
 from peft_pretraining import training_utils, args_utils
-from peft_pretraining.dataloader import PreprocessedIterableDataset, tokenize_and_chunk
+from peft_pretraining.dataloader import SkipDataLoader
 from peft_pretraining.modeling_llama import LlamaForCausalLM, LlamaDecoderLayer
 from peft_pretraining.relora import ReLoRaModel, ReLoRaLinear, merge_and_reinit_functional
 
 transformers.logging.set_verbosity_error()
 
 
-def parse_args(args):
+def parse_args(args=None):
     parser = argparse.ArgumentParser()
 
+    parser.add_argument("--tokenizer", type=str, default="t5-base")
     parser.add_argument("--model_config", type=str, required=True)
-    parser.add_argument("--use_hf_model", default=False, action="store_true")
     parser.add_argument("--continue_from", type=str, default=None, help="Start with warmed-up model weights")
     parser.add_argument("--continue_from_peft", type=str, default=None, help="Continue training with ReLoRA, loading optimizer and scheduler from the checkpoint.")
     parser.add_argument("--restore_optimizer", default=False, action="store_true")
 
-    parser.add_argument("--dataset", type=str, default="c4,en", help="Huggingface dataset name,split (split is optional)")
-    parser.add_argument("--streaming_dataset", default=True, type=lambda x: x.lower() == "true")
+    parser.add_argument("--dataset_path", type=str, required=True, help="Path to a huggingface dataset directory")
 
     parser.add_argument("--batch_size", type=int, required=True)
     parser.add_argument("--gradient_accumulation", type=int, default=None)
@@ -122,36 +119,19 @@ def parse_args(args):
     if args.distributed_type == "fsdp" and args.weight_decay > 0:
         raise ValueError("FSDP does not support weight decay yet.")
 
-    args.dataset = args.dataset.split(",")
-
     return args
 
 
 @torch.no_grad()
-def evaluate_model(model, preprocess_batched, pad_idx, device, batch_size):
-    global_rank = dist.get_rank()
-    world_size = dist.get_world_size()
-
+def evaluate_model(model, eval_dataloader, pad_idx, device):
     _time = time.time()
-
-    val_data = datasets.load_dataset(*args.dataset, split="validation", streaming=True)
-    val_data = val_data.shuffle(seed=42)
-
-    val_data = datasets.distributed.split_dataset_by_node(val_data, rank=global_rank, world_size=world_size)
-
-    val_data_mapped = val_data.map(
-        preprocess_batched,
-        batched=True,
-        remove_columns=["text", "timestamp", "url"],
-    )
-    val_data_mapped.batch = lambda batch_size: training_utils.batch_fn(val_data_mapped, batch_size)
 
     target_eval_tokens = 10_000_000
     ddp_loss_info = torch.zeros(2).to(device)  # [loss, n_tokens]
     tokens_in_batch_info = torch.zeros(1).to(device)
 
     logger.info(f"Eval set prepared in {time.time() - _time:.2f} seconds")
-    for i, batch in enumerate(val_data_mapped.batch(batch_size=batch_size)):
+    for i, batch in enumerate(eval_dataloader):
         if i == 0:
             # this way of estiming the number of eval steps
             # is needed to avoid a deadlock when using FSDP 
@@ -334,45 +314,12 @@ def main(args):
         logger.info(f"{k:30} {v}")
     logger.info("*" * 40)
 
-    # args.dataset can look like this: "[c4, en]", this is why we use the star
-    data = datasets.load_dataset(*args.dataset, split="train", streaming=args.streaming_dataset)
-
-    # this seed is hard-coded to guarantee the same order of the examples (for any --seed)
-    seed_for_shuffle = 42
-    if args.continue_from is not None:
-        # add hash of the path to the checkpoint to the seed
-        seed_for_shuffle += int(hashlib.sha256(args.continue_from.encode("utf-8")).hexdigest(), 16) % 10**8
-    if args.continue_from_peft is not None:
-        seed_for_shuffle += int(hashlib.sha256(args.continue_from_peft.encode("utf-8")).hexdigest(), 16) % 10**8
-
-    logger.info(f"Shuffling data with seed {seed_for_shuffle} (should be 42 for the first run and 42 + hash(checkpoint_path) for the runs that continue from a checkpoint)")
-    data: datasets.Dataset = data.shuffle(seed=seed_for_shuffle)
-    data = datasets.distributed.split_dataset_by_node(
-        data, rank=global_rank, world_size=world_size,
-    )
-
     # it doesn't matter which tokenizer we use, because we train from scratch
     # T5 tokenizer was trained on C4 and we are also training on C4, so it's a good choice
-    tokenizer = AutoTokenizer.from_pretrained("t5-base", model_max_length=args.max_length)
-
-    def preprocess_batched(batch):
-        batch = tokenizer(
-            batch["text"],
-            max_length=args.max_length,
-            truncation=True,
-            padding="max_length",
-            return_tensors="pt",
-        )
-        return batch
-
-    dataset = tokenize_and_chunk(tokenizer, data, text_field="text", sequence_length=args.max_length, num_cpu=args.workers)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, num_workers=args.workers)
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, model_max_length=args.max_length)
 
     model_config = AutoConfig.from_pretrained(args.model_config)
-    if args.use_hf_model:
-        model: HF_LlamaForCausalLM = AutoModelForCausalLM.from_config(model_config)
-    else:
-        model = LlamaForCausalLM(model_config)
+    model = LlamaForCausalLM(model_config)
 
     global_step = 0
     update_step = 0
@@ -587,6 +534,43 @@ def main(args):
         global_step = optimizer_checkpoint["global_step"]
         logger.info(f"Optimizer and scheduler restored from {_optimizer_dir}")
 
+    logger.info("Loading dataset from directory")
+    dataset_dict = datasets.load_from_disk(args.dataset_path)
+    dataset_dict.set_format(type='torch', columns=["input_ids", "attention_mask"])
+
+    train_dataset = dataset_dict["train"]
+    eval_dataset = dataset_dict["validation"]
+
+    # ##############################
+    # Verify dataset
+    minimum_data_size = args.total_batch_size * args.num_training_steps
+    if len(train_dataset) < minimum_data_size:
+        raise ValueError(f"Dataset only has {len(train_dataset)} examples, but we need at least {minimum_data_size}")
+
+    with open(os.path.join(args.dataset_path, "args.json")) as f:
+        dataset_preprocessing_args = json.load(f)
+    assert dataset_preprocessing_args["tokenizer"] == args.tokenizer
+    assert dataset_preprocessing_args["sequence_length"] == args.max_length
+    del dataset_preprocessing_args
+    # ##############################
+
+    train_dataset = datasets.distributed.split_dataset_by_node(train_dataset, rank=global_rank, world_size=world_size)
+    eval_dataset = datasets.distributed.split_dataset_by_node(eval_dataset, rank=global_rank, world_size=world_size)
+
+    train_loader = SkipDataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        collate_fn=default_data_collator,
+        skip_batches=global_step,
+        num_workers=args.workers,
+    )
+    eval_loader = torch.utils.data.DataLoader(
+        eval_dataset,
+        batch_size=args.batch_size,
+        collate_fn=default_data_collator,
+        num_workers=args.workers,
+    )
+
     # global steps and others are defined above
     n_lora_restarts = 0
     pad_idx = tokenizer.pad_token_id
@@ -598,7 +582,7 @@ def main(args):
     # we'll never go through all the data, so no need for epochs
     # ##############################
 
-    for batch in dataloader:
+    for batch in train_loader:
         global_step += 1
         local_step += 1
 
@@ -717,7 +701,7 @@ def main(args):
         if update_step % args.eval_every == 0:
             logger.info(f"Performing evaluation at step {update_step}")
             total_loss, evaluated_on_tokens = evaluate_model(
-                model, preprocess_batched, pad_idx, device, args.batch_size
+                model, eval_loader, pad_idx, device,
             )
 
             if global_rank == 0:
@@ -792,7 +776,7 @@ def main(args):
     torch.cuda.empty_cache()
 
     total_loss, evaluated_on_tokens = evaluate_model(
-        model, preprocess_batched, pad_idx, device, args.batch_size
+        model, eval_loader, pad_idx, device,
     )
 
     if global_rank == 0:
@@ -810,5 +794,5 @@ def main(args):
 
 if __name__ == "__main__":
     print("Starting script")
-    args = parse_args(None)
+    args = parse_args()
     main(args)
