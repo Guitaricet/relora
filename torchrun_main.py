@@ -325,6 +325,7 @@ def main(args):
     update_step = 0
     tokens_seen = 0
     tokens_seen_before = 0
+    n_lora_restarts = 0
 
     if args.continue_from is not None:
         logger.info("*" * 40)
@@ -399,6 +400,7 @@ def main(args):
         update_step = _old_state["update_step"]
         tokens_seen = _old_state["tokens_seen"]
         tokens_seen_before = _old_state["tokens_seen_before"]
+        n_lora_restarts = _old_state["n_lora_restarts"]
         logger.info(f"global_step       : {global_step}")
         logger.info(f"update_step       : {update_step}")
         logger.info(f"tokens_seen       : {tokens_seen}")
@@ -572,7 +574,6 @@ def main(args):
     )
 
     # global steps and others are defined above
-    n_lora_restarts = 0
     pad_idx = tokenizer.pad_token_id
     update_time = time.time()
     local_step = 0  # when continue_from is used, local_step != global_step
