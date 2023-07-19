@@ -6,5 +6,4 @@ peft
 wandb
 loguru
 nvitop
-lion-pytorch
 matplotlib

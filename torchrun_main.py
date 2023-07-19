@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 import torch.utils.data
 import torch.distributed as dist
+from torch.distributed.optim import ZeroRedundancyOptimizer
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
     FullStateDictConfig,
@@ -29,7 +30,8 @@ from torch.distributed.fsdp import (
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
 import transformers
-from transformers import AutoConfig, AutoTokenizer, default_data_collator
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, default_data_collator
+from optimum.bettertransformer import BetterTransformer
 
 import datasets
 import datasets.distributed
@@ -49,8 +51,9 @@ transformers.logging.set_verbosity_error()
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--tokenizer", type=str, default="t5-base")
-    parser.add_argument("--model_config", type=str, required=True)
+    parser.add_argument("--model_config", type=str, default=None)
+    parser.add_argument("--model_name_or_path", type=str, default=None, help="Huggingface model identifier, alternative to --model_config")
+    parser.add_argument("--model_revision", type=str, default=None, help="Tag name, branch name, or commit hash of the model from HuggingFace Hub. E.g., v2.0.1 or step1000")
     parser.add_argument("--continue_from", type=str, default=None, help="Start with warmed-up model weights")
     parser.add_argument("--continue_from_peft", type=str, default=None, help="Continue training with ReLoRA, loading optimizer and scheduler from the checkpoint.")
     parser.add_argument("--restore_optimizer", default=False, action="store_true")
@@ -76,7 +79,7 @@ def parse_args(args=None):
                               "Useful for making sure that full-LoRa model is equivalent to model+LoRa."))
 
     parser.add_argument("--train_ln", default=True, action="store_true")
-    parser.add_argument("--optimizer", default="Adam", choices=["Adam", "Shampoo"])
+    parser.add_argument("--optimizer", default="Adam", help="Could be adam or adam_zero for ZeroRedundancyOptimizer")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--scheduler", type=str, default="cosine", choices=["linear", "cosine", "cosine_restarts"])
     parser.add_argument("--cycle_length", type=int, default=None, help="Number of steps per cycle for cosine scheduler")
@@ -103,21 +106,13 @@ def parse_args(args=None):
     parser.add_argument("--workers", type=int, default=8)
 
     parser.add_argument("--distributed_type", type=str, default="ddp", choices=["fsdp", "ddp"])
+    parser.add_argument("--zero_optimization", default=False, action="store_true")
 
     parser.add_argument("--seed", type=int, default=0)
 
     args = parser.parse_args(args)
 
     args = args_utils.check_args_torchrun_main(args)
-
-    if args.continue_from_peft and not args.restore_optimizer:
-        logger.warning("--continue_from_peft is set, but --restore_optimizer is not. "
-                       "This means that you will train with the optimizer from the checkpoint, "
-                       "but will not save the optimizer state. "
-                       "This is probably not what you want.")
-
-    if args.distributed_type == "fsdp" and args.weight_decay > 0:
-        raise ValueError("FSDP does not support weight decay yet.")
 
     return args
 
@@ -130,7 +125,7 @@ def evaluate_model(model, eval_dataloader, pad_idx, device):
     ddp_loss_info = torch.zeros(2).to(device)  # [loss, n_tokens]
     tokens_in_batch_info = torch.zeros(1).to(device)
 
-    logger.info(f"Eval set prepared in {time.time() - _time:.2f} seconds")
+    rank = dist.get_rank()
     for i, batch in enumerate(eval_dataloader):
         if i == 0:
             # this way of estiming the number of eval steps
@@ -145,10 +140,17 @@ def evaluate_model(model, eval_dataloader, pad_idx, device):
         labels = batch["input_ids"].clone()
         labels[labels == pad_idx] = -100
         loss = model(**batch, labels=labels).loss
+        if torch.isnan(ddp_loss_info[0]):
+            print(f"Rank {dist.get_rank()} got nan loss. This is probably a bug.")
 
         tokens_in_batch = (batch["input_ids"] != pad_idx).sum().item()
+        assert tokens_in_batch > 0, "Batch size is zero"
         ddp_loss_info[0] += loss.detach()
         ddp_loss_info[1] += tokens_in_batch
+
+    # check if loss is nan
+    if torch.isnan(ddp_loss_info[0]):
+        raise RuntimeError(f"Rank {rank} got nan loss. This is probably a bug.")
 
     # Gather losses across all GPUs
     dist.all_reduce(ddp_loss_info, op=dist.ReduceOp.SUM)
@@ -201,7 +203,10 @@ def save_model_ddp(model, optimizer, scheduler, training_state_checkpoint, run_c
     if global_rank == 0:
         os.makedirs(os.path.dirname(save_dir), exist_ok=True)
 
-    model.module.save_pretrained(save_dir)
+    unwrapped_model = model.module
+    unwrapped_model = BetterTransformer.reverse(unwrapped_model)
+    unwrapped_model.save_pretrained(save_dir)
+
     optimizer_checkpoint = {
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
@@ -225,7 +230,9 @@ def save_model_fsdp(model, optimizer, scheduler, training_state_checkpoint, run_
         if global_rank == 0:
             os.makedirs(os.path.dirname(save_dir), exist_ok=True)
 
-        model.module.save_pretrained(save_dir)
+        unwrapped_model = model.module
+        unwrapped_model = BetterTransformer.reverse(unwrapped_model)
+        unwrapped_model.save_pretrained(save_dir)
 
         if global_rank == 0:
             optimizer_checkpoint = {
@@ -314,12 +321,36 @@ def main(args):
         logger.info(f"{k:30} {v}")
     logger.info("*" * 40)
 
-    # it doesn't matter which tokenizer we use, because we train from scratch
-    # T5 tokenizer was trained on C4 and we are also training on C4, so it's a good choice
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, model_max_length=args.max_length)
+    logger.info("Loading dataset from directory")
+    dataset_dict = datasets.load_from_disk(args.dataset_path)
+    dataset_dict.set_format(type='torch', columns=["input_ids", "attention_mask"])
 
-    model_config = AutoConfig.from_pretrained(args.model_config)
-    model = LlamaForCausalLM(model_config)
+    train_dataset = dataset_dict["train"]
+    eval_dataset = dataset_dict["validation"]
+
+    # ##############################
+    # Verify dataset
+    minimum_data_size = args.total_batch_size * args.num_training_steps
+    if len(train_dataset) < minimum_data_size:
+        raise ValueError(f"Dataset only has {len(train_dataset)} examples, but we need at least {minimum_data_size}")
+
+    with open(os.path.join(args.dataset_path, "args.json")) as f:
+        dataset_preprocessing_args = json.load(f)
+    assert dataset_preprocessing_args["sequence_length"] == args.max_length
+    # ##############################
+    tokenizer = AutoTokenizer.from_pretrained(dataset_preprocessing_args["tokenizer"], model_max_length=args.max_length)
+
+    if args.model_config is not None:
+        model_config = AutoConfig.from_pretrained(args.model_config)
+        if model_config.vocab_size != tokenizer.vocab_size:
+            raise ValueError(f"Model config vocab size ({model_config.vocab_size}) "
+                            f"does not match tokenizer vocab size ({tokenizer.vocab_size})")
+
+        model = LlamaForCausalLM(model_config)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, revision=args.model_revision)
+        model = BetterTransformer.transform(model)
+        model_config = model.config
 
     global_step = 0
     update_step = 0
@@ -422,6 +453,10 @@ def main(args):
     else:
         model = model.to(device=device)
 
+    n_total_params = sum(p.numel() for p in model.parameters())
+    n_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    p_trainable_params = n_trainable_params / n_total_params
+
     if args.distributed_type == "fsdp":
         logger.info("Wrapping model with FSDP")
         model: Union[FSDP, ReLoRaModel, LlamaForCausalLM] = initialize_fsdp(model, dtype=args.dtype)
@@ -463,10 +498,8 @@ def main(args):
         time.sleep(10)
         logger.info("********************* end of FSDP device placement ***********************")
 
-    n_total_params = sum(p.numel() for p in model.parameters())
-    n_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    p_trainable_params = n_trainable_params / n_total_params
-
+    # Computing the number of parameters is done before wrapping the model with FSDP
+    # but gettint the parameters for optimization is done after. This is intentional and doing it other way causes errors.
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     lora_params = [p for n, p in model.named_parameters() if p.requires_grad and "lora_" in n]
     trainable_params_names = [name for name, p in model.named_parameters() if p.requires_grad]
@@ -474,6 +507,7 @@ def main(args):
     # Initialize wandb
     run_config = dict(vars(args))
     run_config.update({
+        "tokenizer": dataset_preprocessing_args["tokenizer"],
         "max_lr": run_config.pop("lr"),  # rename lr to max_lr to avoid conflicts with scheduler
         "total_params_M": n_total_params / 1_000_000,
         "trainable_params_M": n_trainable_params / 1_000_000,
@@ -483,6 +517,7 @@ def main(args):
         "model": model_config.to_dict(),
         "world_size": world_size,
         "device": str(device),
+        "dataset_preprocessing_args": dataset_preprocessing_args,
     })
 
     if args.use_peft:
@@ -505,6 +540,8 @@ def main(args):
     if args.optimizer.lower() == "adam":
         optimizer = torch.optim.Adam(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
         optimizer_state_keys = ["exp_avg", "exp_avg_sq"]
+    elif args.optimizer.lower() == "adam_zero":
+        optimizer = ZeroRedundancyOptimizer(trainable_params, optimizer_class=torch.optim.Adam, lr=args.lr, weight_decay=args.weight_decay)
     else:
         raise ValueError(f"Optimizer {args.optimizer} not supported")
 
@@ -536,26 +573,6 @@ def main(args):
         global_step = optimizer_checkpoint["global_step"]
         logger.info(f"Optimizer and scheduler restored from {_optimizer_dir}")
 
-    logger.info("Loading dataset from directory")
-    dataset_dict = datasets.load_from_disk(args.dataset_path)
-    dataset_dict.set_format(type='torch', columns=["input_ids", "attention_mask"])
-
-    train_dataset = dataset_dict["train"]
-    eval_dataset = dataset_dict["validation"]
-
-    # ##############################
-    # Verify dataset
-    minimum_data_size = args.total_batch_size * args.num_training_steps
-    if len(train_dataset) < minimum_data_size:
-        raise ValueError(f"Dataset only has {len(train_dataset)} examples, but we need at least {minimum_data_size}")
-
-    with open(os.path.join(args.dataset_path, "args.json")) as f:
-        dataset_preprocessing_args = json.load(f)
-    assert dataset_preprocessing_args["tokenizer"] == args.tokenizer
-    assert dataset_preprocessing_args["sequence_length"] == args.max_length
-    del dataset_preprocessing_args
-    # ##############################
-
     train_dataset = datasets.distributed.split_dataset_by_node(train_dataset, rank=global_rank, world_size=world_size)
     eval_dataset = datasets.distributed.split_dataset_by_node(eval_dataset, rank=global_rank, world_size=world_size)
 
@@ -575,6 +592,11 @@ def main(args):
 
     # global steps and others are defined above
     pad_idx = tokenizer.pad_token_id
+    if pad_idx is None:
+        logger.warning("Tokenizer does not have a pad token. Using eos_token_id as pad token id")
+        pad_idx = tokenizer.eos_token_id
+        assert pad_idx is not None, "Tokenizer does not have a pad token or eos token"
+
     update_time = time.time()
     local_step = 0  # when continue_from is used, local_step != global_step
 
@@ -598,6 +620,7 @@ def main(args):
         tokens_seen += (batch["input_ids"] != pad_idx).sum().item() * world_size
 
         loss = model(**batch, labels=labels).loss
+        assert not torch.isnan(loss), "Loss is nan"
         scaled_loss = loss / args.gradient_accumulation
         scaled_loss.backward()
 
