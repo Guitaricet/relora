@@ -43,7 +43,10 @@ def main(args):
     logger.info("*" * 40)
 
     _tokenizer_name_for_save = args.tokenizer.replace("/", "_")
-    save_path = os.path.join(args.save_dir, f"{args.dataset}_{args.dataset_config}_{_tokenizer_name_for_save}_{args.sequence_length}")
+    save_path = os.path.join(args.save_dir, f"{args.dataset}_{_tokenizer_name_for_save}_{args.sequence_length}")
+    if args.dataset_config is not None:
+        save_path = os.path.join(args.save_dir, f"{args.dataset}_{args.dataset_config}_{_tokenizer_name_for_save}_{args.sequence_length}")
+
     if os.path.exists(save_path):
         raise ValueError(f"Path {save_path} already exists")
 

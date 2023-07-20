@@ -2,6 +2,8 @@
 Distributed training code for ReLoRA.
 """
 import os
+import sys
+import yaml
 import time
 import json
 import random
@@ -51,20 +53,22 @@ transformers.logging.set_verbosity_error()
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
 
+    parser.add_argument("--training_config", type=str, default=False, help="Alternative to providing the parameters. Overrides all parameters. Path to a yaml file with training run config")
+
     parser.add_argument("--model_config", type=str, default=None)
     parser.add_argument("--model_name_or_path", type=str, default=None, help="Huggingface model identifier, alternative to --model_config")
     parser.add_argument("--model_revision", type=str, default=None, help="Tag name, branch name, or commit hash of the model from HuggingFace Hub. E.g., v2.0.1 or step1000")
     parser.add_argument("--warmed_up_model", type=str, default=None, help="Start with warmed-up model weights. Does not restore optimizer and scheduler.")
     parser.add_argument("--resume_from", type=str, default=None, help="Continue training with ReLoRA, loading optimizer and scheduler from the checkpoint.")
 
-    parser.add_argument("--dataset_path", type=str, required=True, help="Path to a huggingface dataset directory")
-
-    parser.add_argument("--batch_size", type=int, required=True)
-    parser.add_argument("--gradient_accumulation", type=int, default=None)
-    parser.add_argument("--total_batch_size", type=int, default=None)
+    parser.add_argument("--dataset_path", type=str, help="Path to a huggingface dataset directory")
     parser.add_argument("--max_length", type=int, default=256)
 
-    parser.add_argument("--use_peft", action="store_true")
+    parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--gradient_accumulation", type=int, default=None)
+    parser.add_argument("--total_batch_size", type=int, default=None)
+
+    parser.add_argument("--use_peft", default=False, type=lambda x: x.lower() == "true")
     parser.add_argument("--lora_r", type=int, default=128)
     parser.add_argument("--relora", type=int, default=None)
     parser.add_argument("--train_scaling", default=False, action="store_true")
@@ -78,7 +82,7 @@ def parse_args(args=None):
                               "Useful for making sure that full-LoRa model is equivalent to model+LoRa."))
 
     parser.add_argument("--train_ln", default=True, action="store_true")
-    parser.add_argument("--optimizer", default="Adam", help="Could be adam or adam_zero for ZeroRedundancyOptimizer")
+    parser.add_argument("--optimizer", default="Adam", help="Could be adam (for AdamW) or adam_zero for ZeroRedundancyOptimizer(AdamW)")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--scheduler", type=str, default="cosine", choices=["linear", "cosine", "cosine_restarts"])
     parser.add_argument("--cycle_length", type=int, default=None, help="Number of steps per cycle for cosine scheduler")
@@ -87,6 +91,8 @@ def parse_args(args=None):
                             f"Useful when you want to sync ReLoRA resets with the scheduler for a warmed up model. "
                             f"You need to use it, when your warmup_step % relora_resets != 0")
     parser.add_argument("--min_lr_ratio", type=float, default=0.1)
+    parser.add_argument("--adam_beta1", type=float, default=0.9)
+    parser.add_argument("--adam_beta2", type=float, default=0.999)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--warmup_steps", type=int, default=1_000)
 
@@ -105,13 +111,25 @@ def parse_args(args=None):
     parser.add_argument("--workers", type=int, default=8)
 
     parser.add_argument("--distributed_type", type=str, default="ddp", choices=["fsdp", "ddp"])
-    parser.add_argument("--zero_optimization", default=False, action="store_true")
-    parser.add_argument("--autoresume", default=False, action="store_true")
+    parser.add_argument("--autoresume", default=False, type=lambda x: x.lower() == "true")
     parser.add_argument("--comment", type=str, default=None, help="Wandb notes")
 
     parser.add_argument("--seed", type=int, default=0)
 
     args = parser.parse_args(args)
+
+    if args.training_config is not None:
+        logger.info(f"Yaml config provided for the run. The file {args.training_config} is used to provide all the parameters.")
+        if len(sys.argv) > 3:
+            logger.error(f"argv length is {len(sys.argv)}")
+            raise RuntimeError(
+                "You provided both a yaml config and command line arguments. "
+                "Please use only one of the two options."
+            )
+        with open(args.training_config) as f:
+            training_config = yaml.safe_load(f)
+        for k, v in training_config.items():
+            setattr(args, k, v)
 
     args = args_utils.check_args_torchrun_main(args)
 
@@ -440,7 +458,7 @@ def main(args):
             lora_dropout=0.1,
             target_modules=["attn", "attention", "mlp"],
             trainable_scaling=args.train_scaling,
-            keep_original_weights=args.warmed_up_model is not None or args.force_keep_original,
+            keep_original_weights=args.relora or args.force_keep_original,
             lora_only=not need_linear_weight,
         )
 
@@ -553,11 +571,21 @@ def main(args):
         pbar = tqdm(total=args.num_training_steps - update_step, desc="Update steps", ncols=80)
 
     optimizer_state_keys = None
+    optimizer_kwargs = {
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "beta1": args.adam_beta1,
+        "beta2": args.adam_beta2,
+    }
     if args.optimizer.lower() == "adam":
-        optimizer = torch.optim.Adam(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+        optimizer = torch.optim.AdamW(trainable_params, **optimizer_kwargs)
         optimizer_state_keys = ["exp_avg", "exp_avg_sq"]
     elif args.optimizer.lower() == "adam_zero":
-        optimizer = ZeroRedundancyOptimizer(trainable_params, optimizer_class=torch.optim.Adam, lr=args.lr, weight_decay=args.weight_decay)
+        optimizer = ZeroRedundancyOptimizer(
+            trainable_params,
+            optimizer_class=torch.optim.AdamW,
+            **optimizer_kwargs,
+        )
         optimizer_state_keys = ["exp_avg", "exp_avg_sq"]
     else:
         raise ValueError(f"Optimizer {args.optimizer} not supported")

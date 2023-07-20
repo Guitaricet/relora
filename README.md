@@ -3,6 +3,7 @@
 
 ## Setup
 
+Requires Python 3.10+ (due to param annotaitons style) and PyTorch 2.0+ (for flash attention).
 All requirements are listed in `requirements.txt` and kept up-to-date.
 
 ```bash
@@ -10,11 +11,64 @@ cd peft_pretraining
 pip install -r requirements.txt
 ```
 
+## 1B training script
+
+1. Pretokenize the data
+```bash
+python pretokenize.py \
+    --tokenizer EleutherAI/gpt-neox-20b \
+    --dataset EleutherAI/pile \
+    --sequence_length 2048 \
+    --save_dir preprocessed_data
+```
+
+--use_peft --relora 20 --force_keep_original
+
+1. Train the model
+
+The rule of thumb of selecting the learning rate I use for now is 2X regular training learning rate.
+It might require tuning on larger models.
+Microbatch size depends on the GPU memory and needs to be tuned to maximize the throughput.
+Note that relora allows to use larger microbatch sizes than regular training.
+
+Number of steps is 143K (Pythia) minus 10K, because we start from the checkpoint at 10K steps.
+Relora reset frequency is 5320 so that the number of steps is would be divisible by it.
+
+```bash
+torchrun --nproc-per-node <N_GPUS> --nnodes <N_NODES> \
+torchrun --nproc-per-node 2 \
+    torchrun_main.py \
+    --training_config training_configs/1B_v1.0.yaml
+    # --dataset_path preprocessed_data/EleutherAI/pile_EleutherAI_gpt-neox-20b_2048 \
+    # --max_length 2048 \
+    # --model_name_or_path EleutherAI/pythia-1b \
+    # --model_revision step10000 \
+    # --use_peft \
+    # --force_keep_original \
+    # --lora_r 128 \
+    # --relora $RELORA_FREQ \
+    # --optimizer adam_zero \
+    # --lr $MAX_LR \
+    # --batch_size $MICROBATCH_SIZE \
+    # --warmup 13_000 \
+    # --scheduler cosine_restarts \
+    # --cycle_length $RELORA_FREQ \
+    # --restart_warmup_steps 100 \
+    # --total_batch_size 1024 \
+    # --num_training_steps 133_000 \
+    # --eval_every 1000 \
+    # --save_every 1000 \
+    # --distributed_type ddp \
+    # --reset_optimizer_on_relora False \
+    # --optimizer_magnitude_pruning 0.9 \
+    # --tags relora1b
+```
+
 ## Usage
 
 To train a model using ReLoRA, first, perform a warmup through regular training.
 
-Train language model with PEFT
+Train language model without PEFT
 ```bash
 torchrun --nproc-per-node <N_GPUS> torchrun_main.py \
     --model_config configs/llama_250m.json \
@@ -31,7 +85,7 @@ torchrun --nproc-per-node <N_GPUS> torchrun_main.py \
 
 When you have a warmed-up network checkpoint, run the script with ReLoRA enabled. Note that we use a larger LR during the ReLoRA stage.
 
-Train without PEFT
+Train with PEFT
 ```bash
 torchrun --nproc-per-node <N_GPUS> torchrun_main.py \
     --model_config configs/llama_250m.json \
@@ -49,7 +103,7 @@ torchrun --nproc-per-node <N_GPUS> torchrun_main.py \
     --num_training_steps 20000 \
     --save_every 5000 \
     --eval_every 5000 \
-    --continue_from checkpoints/llama_250m-2023-06-09-11-29-56/model_5000 \
+    --warmed_up_model checkpoints/llama_250m-2023-06-09-11-29-56/model_5000 \
     --tags relora_250M
 ```
 
@@ -84,10 +138,10 @@ Specifically `cosine_restarts` that works in cyclical mode that repeats the warm
 
 ## Warm starts
 
-You can start LoRa from a partially trained checkpoint. To do that, provide `--continue_from` option. For example:
+You can start LoRa from a partially trained checkpoint. To do that, provide `--warmed_up_model` option. For example:
 
 ```
-torchrun torchrun_main.py ... <other options> .. --continue_from checkpoints/llama_1b-2023-05-05-20-12-43/model_1000
+torchrun torchrun_main.py ... <other options> .. --warmed_up_model checkpoints/llama_1b-2023-05-05-20-12-43/model_1000
 ```
 
 ## Distributed training
@@ -115,7 +169,6 @@ torchrun --nproc-per-node 8 torchrun_main.py \
 ```
 
 Where `--nproc-per-node` is the nubmer of GPUs you are using.
-
 
 ## Citation
 

@@ -5,6 +5,12 @@ from loguru import logger
 
 
 def check_args_torchrun_main(args):
+    if args.dataset_path is None:
+        raise ValueError("dataset_path must be specified")
+
+    if args.batch_size is None:
+        raise ValueError("batch_size must be specified")
+
     if not args.train_ln:
         logger.error("Are you sure? Not training LN is a bad idea.")
         raise ValueError("Are you sure? Not training LN is a bad idea.")
@@ -62,5 +68,10 @@ def check_args_torchrun_main(args):
 
     if args.distributed_type == "fsdp" and "zero" in args.optimizer:
         raise ValueError("FSDP does zero-optimization by default, do not specify optimizer as zero optimizer.")
+
+    if args.relora:
+        if args.cycle_length is not None and args.cycle_length != args.relora:
+            logger.warning(f"Overriding --cycle_length ({args.cycle_length}) to be equal to --relora ({args.relora})")
+        args.cycle_length = args.relora
 
     return args

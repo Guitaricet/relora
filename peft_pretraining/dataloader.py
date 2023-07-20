@@ -108,9 +108,11 @@ def tokenize_and_chunk(
         }
         return result
 
+    remove_columns = ["attention_mask"]
     train_dataset = tokenized_dataset.map(
         group_texts,
         batched=True,
+        remove_columns=remove_columns,
         **extra_map_kwargs,
     )
     logger.info(f"Chunking finished")

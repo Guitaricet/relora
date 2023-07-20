@@ -11,11 +11,6 @@ import transformers
 from loguru import logger
 
 
-def _no_grad_zero_(tensor):
-    with torch.no_grad():
-        return tensor.zero_()
-
-
 def get_scheculer(
     optimizer,
     *,
@@ -253,7 +248,7 @@ def optimizer_reset(
     # pruning_fn has to be inplace to work with ZeroRedundancyOptimizer
     if reset_optimizer_on_relora:
         logger.info("Resetting optimizer states to zeros")
-        pruning_fn = _no_grad_zero_
+        pruning_fn = partial(random_pruning_, prune_ratio=1)
     elif optimizer_random_pruning:
         logger.info(f"Performing random pruning of optimizer states. "
                     f"Pruning {optimizer_random_pruning} percent")
