@@ -1,9 +1,19 @@
+import os
+import json
 import math
 from functools import partial
 
 import torch
 from torch.optim.lr_scheduler import LambdaLR
+from torch.distributed.optim import ZeroRedundancyOptimizer
 import transformers
+
+from loguru import logger
+
+
+def _no_grad_zero_(tensor):
+    with torch.no_grad():
+        return tensor.zero_()
 
 
 def get_scheculer(
@@ -101,28 +111,26 @@ def get_cosine_schedule_with_multiple_warmups(
 
 
 @torch.no_grad()
-def random_pruning(tensor, prune_ratio):
+def random_pruning_(tensor, prune_ratio):
     """
-    Performs random pruning dimensionality reduction.
+    Performs random pruning dimensionality reduction **inplace**.
     Only reduces the inner dimensionality, does not affect the shape of the tensor
     """
     random_pruning_mask = torch.rand_like(tensor) > prune_ratio
-    tensor = tensor * random_pruning_mask
-    return tensor
+    tensor.mul_(random_pruning_mask)
 
 
 @torch.no_grad()
-def magnitude_pruning(tensor, prune_ratio):
+def magnitude_pruning_(tensor, prune_ratio):
     """
-    Performs magnitude pruning dimensionality reduction.
+    Performs magnitude pruning dimensionality reduction **inplace**.
     Only reduces the inner dimensionality, does not affect the shape of the tensor
     """
     tensor_magnitude = torch.abs(tensor)
     threshold = torch.quantile(tensor_magnitude.flatten().to(dtype=torch.float32), prune_ratio).to(dtype=tensor.dtype)
 
     mask = tensor_magnitude > threshold
-    tensor = tensor * mask.to(dtype=tensor.dtype)
-    return tensor
+    tensor.mul_(mask.to(dtype=tensor.dtype))
 
 
 def _get_cyclical_cosine_schedule_with_min_lr_lambda(current_step, *, num_warmup_steps, cycle_length, min_lr_ratio):
@@ -191,26 +199,6 @@ def _get_cosine_schedule_with_multiple_warmups_lambda(
     return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
 
 
-def collate_fn(batch_list):
-    batch = {
-        "input_ids": torch.stack([example["input_ids"] for example in batch_list]),
-        "attention_mask": torch.stack([example["attention_mask"] for example in batch_list]),
-    }
-    return batch
-
-
-def batch_fn(dataset, batch_size):
-    batch = []
-    for example in dataset:
-        batch.append(example)
-        if len(batch) == batch_size:
-            batch = collate_fn(batch)
-            yield batch
-            batch = []
-    if len(batch) > 0:
-        yield batch
-
-
 def max_train_tokens_to_number(max_train_tokens):
     if max_train_tokens.endswith("M"):
         return int(max_train_tokens.rstrip("M")) * 1_000_000
@@ -218,3 +206,102 @@ def max_train_tokens_to_number(max_train_tokens):
         return int(max_train_tokens.rstrip("B")) * 1_000_000_000
     else:
         return int(max_train_tokens)
+
+
+def get_last_training_state(save_dir):
+    # list all directories in the save_dir
+    # find the model with the highest number of iterations "{args.save_dir}/model_{update_step}"
+    model_dirs = [d for d in os.listdir(save_dir) if d.startswith(f"model_")]
+    if len(model_dirs) == 0:
+        logger.warning(f"Save directory {save_dir} exists, but does not contain any models.")
+        logger.warning("Starting training from scratch.")
+        return None, None
+
+    model_dirs = sorted(model_dirs, key=lambda x: int(x.split("_")[-1]))
+    resume_from = model_dirs[-1]
+
+    logger.info(f"Restarting training from {resume_from}")
+    with open(os.path.join(resume_from, "training_state.json")) as f:
+        training_state = json.load(f)
+
+    return training_state, resume_from
+
+
+def optimizer_reset(
+    optimizer,
+    *,
+    reset_params: list[torch.nn.Parameter],
+    optimizer_state_keys: list[str],
+    reset_optimizer_on_relora: bool,
+    optimizer_random_pruning: float,
+    optimizer_magnitude_pruning: float,
+):
+    """
+        optimizer_state_keys: e.g., ["exp_avg", "exp_avg_sq"]
+    """
+    n_reset_types = (
+        int(bool(reset_optimizer_on_relora))
+        + int(bool(optimizer_random_pruning))
+        + int(bool(optimizer_magnitude_pruning))
+    )
+    if n_reset_types != 1:
+        logger.warning(f"Got {reset_optimizer_on_relora=}, {optimizer_random_pruning=}, "
+                       f"{optimizer_magnitude_pruning=}")
+        raise ValueError(f"Exactly one of reset_optimizer_on_relora, "
+                         f"optimizer_random_pruning, optimizer_magnitude_pruning must be True")
+
+    # pruning_fn has to be inplace to work with ZeroRedundancyOptimizer
+    if reset_optimizer_on_relora:
+        logger.info("Resetting optimizer states to zeros")
+        pruning_fn = _no_grad_zero_
+    elif optimizer_random_pruning:
+        logger.info(f"Performing random pruning of optimizer states. "
+                    f"Pruning {optimizer_random_pruning} percent")
+        pruning_fn = partial(random_pruning_, prune_ratio=optimizer_random_pruning)
+    elif optimizer_magnitude_pruning:
+        logger.info(f"Performing magnitude pruning of optimizer states. "
+                    f"Pruning {optimizer_magnitude_pruning} percent")
+        pruning_fn = partial(magnitude_pruning_, prune_ratio=optimizer_magnitude_pruning)
+    else:
+        raise ValueError("Unknown pruning type")
+
+    # import time
+    # import torch.distributed as dist
+    # rank = dist.get_rank()
+    # if rank == 1:
+    #     time.sleep(5)
+    # print("*"*100)
+    # print(f"rank: {rank}")
+    # print(f"Optimizer state values for rank {rank}: {optimizer.optim.state.items()}")
+    # print("*"*100)
+
+    # ############################################################
+    # A reminder on how optimizer state is structured for regular optimizers:
+    # optimizer.state is a dict[torch.nn.Parameter, dict[str, torch.Tensor]]
+    # optimizer.state[p] is a dict[str, torch.Tensor] where str is
+    # an optimizer state key e.g., "exp_avg", "exp_avg_sq"
+    # Note that none of these tensors has parameter names
+    # and parameter maps to a **dictionary** of opt. states, not a tensor
+    # 
+    # For ZeroRedundancyOptimizer, it works differently.
+    # ZeroRedundancyOptimizer.state always maps to empty dicts.
+    # Instead, it uses optimizer.optim.state for rank-local updates.
+    # ############################################################
+    n_zeros = 0
+    n_total = 0
+
+    optimizer_state = optimizer.state
+    if isinstance(optimizer, ZeroRedundancyOptimizer):
+        optimizer_state = optimizer.optim.state
+
+    for p in reset_params:
+        param_state = optimizer_state[p]
+        if len(param_state) == 0: # no state for this param, happens for ZeRo optimizer
+            continue
+        for key in optimizer_state_keys:
+            pruning_fn(param_state[key])  # pruning fn has to be inplace to keep the same keys in the dict
+            n_total += param_state[key].numel()
+            n_zeros += torch.sum(param_state[key] == 0).item()
+
+    _zeroed = n_zeros / (1e-7 + n_total) * 100
+    logger.info(f"Percent of optimizer states zeroed: {_zeroed:.2f}")

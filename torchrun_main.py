@@ -1,9 +1,5 @@
 """
 Distributed training code for ReLoRA.
-
-IMPORTANT:
-The number of training steps is assumed to be smaller than the number of batches in the dataset (<= 1 epoch).
-Meaning if provided with 1000000000 steps, it may stop earlier than that if the script run out of data.
 """
 import os
 import time
@@ -22,15 +18,19 @@ import torch.distributed as dist
 from torch.distributed.optim import ZeroRedundancyOptimizer
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
-    FullStateDictConfig,
-    ShardedStateDictConfig,
     MixedPrecision,
     StateDictType,
 )
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
 import transformers
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, default_data_collator
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    LlamaConfig,
+    default_data_collator,
+)
 from optimum.bettertransformer import BetterTransformer
 
 import datasets
@@ -54,9 +54,8 @@ def parse_args(args=None):
     parser.add_argument("--model_config", type=str, default=None)
     parser.add_argument("--model_name_or_path", type=str, default=None, help="Huggingface model identifier, alternative to --model_config")
     parser.add_argument("--model_revision", type=str, default=None, help="Tag name, branch name, or commit hash of the model from HuggingFace Hub. E.g., v2.0.1 or step1000")
-    parser.add_argument("--continue_from", type=str, default=None, help="Start with warmed-up model weights")
-    parser.add_argument("--continue_from_peft", type=str, default=None, help="Continue training with ReLoRA, loading optimizer and scheduler from the checkpoint.")
-    parser.add_argument("--restore_optimizer", default=False, action="store_true")
+    parser.add_argument("--warmed_up_model", type=str, default=None, help="Start with warmed-up model weights. Does not restore optimizer and scheduler.")
+    parser.add_argument("--resume_from", type=str, default=None, help="Continue training with ReLoRA, loading optimizer and scheduler from the checkpoint.")
 
     parser.add_argument("--dataset_path", type=str, required=True, help="Path to a huggingface dataset directory")
 
@@ -107,6 +106,8 @@ def parse_args(args=None):
 
     parser.add_argument("--distributed_type", type=str, default="ddp", choices=["fsdp", "ddp"])
     parser.add_argument("--zero_optimization", default=False, action="store_true")
+    parser.add_argument("--autoresume", default=False, action="store_true")
+    parser.add_argument("--comment", type=str, default=None, help="Wandb notes")
 
     parser.add_argument("--seed", type=int, default=0)
 
@@ -118,10 +119,9 @@ def parse_args(args=None):
 
 
 @torch.no_grad()
-def evaluate_model(model, eval_dataloader, pad_idx, device):
+def evaluate_model(model, eval_dataloader, pad_idx, device, target_eval_tokens=10_000_000):
     _time = time.time()
 
-    target_eval_tokens = 10_000_000
     ddp_loss_info = torch.zeros(2).to(device)  # [loss, n_tokens]
     tokens_in_batch_info = torch.zeros(1).to(device)
 
@@ -196,33 +196,50 @@ def initialize_fsdp(model, dtype):
 
 def save_model_ddp(model, optimizer, scheduler, training_state_checkpoint, run_config, save_dir):
     global_rank = dist.get_rank()
-    if global_rank != 0: return
-
-    update_step = training_state_checkpoint["update_step"]
+    _time = time.time()
 
     if global_rank == 0:
+        update_step = training_state_checkpoint["update_step"]
         os.makedirs(os.path.dirname(save_dir), exist_ok=True)
 
-    unwrapped_model = model.module
-    unwrapped_model = BetterTransformer.reverse(unwrapped_model)
-    unwrapped_model.save_pretrained(save_dir)
+        _model = model.module
+        if isinstance(_model, ReLoRaModel):
+            _model.wrapped_model = BetterTransformer.reverse(_model.wrapped_model)
+        else:
+            _model = BetterTransformer.reverse(_model)
 
-    optimizer_checkpoint = {
-        "optimizer": optimizer.state_dict(),
-        "scheduler": scheduler.state_dict(),
-        "update_step": update_step,
-        "global_step": training_state_checkpoint["global_step"],
-        "config": run_config,
-        "wandb": wandb.run.dir,
-        "dtype": args.dtype,
-    }
-    torch.save(optimizer_checkpoint, f"{save_dir}/optimizer.pt")
+        _model.save_pretrained(save_dir)
+        if isinstance(_model, ReLoRaModel):
+            _model.wrapped_model = BetterTransformer.transform(_model.wrapped_model)
+        else:
+            _model = BetterTransformer.transform(_model)
 
-    with open(f"{save_dir}/training_state.json", "w") as f:
-        json.dump(training_state_checkpoint, f, indent=4)
+    dist.barrier()
+    if isinstance(optimizer, ZeroRedundancyOptimizer):
+        logger.info("Started consolidating optimizer state dict")
+        optimizer.consolidate_state_dict()
+        logger.info(f"Consolidating optimizer state dict took {time.time() - _time:.2f} seconds")
 
+    if global_rank == 0:
+        optimizer_checkpoint = {
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "update_step": update_step,
+            "global_step": training_state_checkpoint["global_step"],
+            "config": run_config,
+            "dtype": args.dtype,
+        }
+        torch.save(optimizer_checkpoint, f"{save_dir}/optimizer.pt")
+
+        training_state_checkpoint["wandb_id"] = wandb.run.id
+        with open(f"{save_dir}/training_state.json", "w") as f:
+            json.dump(training_state_checkpoint, f, indent=4)
+
+    logger.info(f"Saving took {time.time() - _time:.2f} seconds")
+    dist.barrier()
 
 def save_model_fsdp(model, optimizer, scheduler, training_state_checkpoint, run_config, save_dir):
+    raise RuntimeError("FSDP is not supported anymore. There were a lot of isses with ReLoRA and FSDP and no speed or memory improvements.")
     with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
         global_rank = dist.get_rank()
         update_step = training_state_checkpoint["update_step"]
@@ -230,9 +247,10 @@ def save_model_fsdp(model, optimizer, scheduler, training_state_checkpoint, run_
         if global_rank == 0:
             os.makedirs(os.path.dirname(save_dir), exist_ok=True)
 
-        unwrapped_model = model.module
-        unwrapped_model = BetterTransformer.reverse(unwrapped_model)
-        unwrapped_model.save_pretrained(save_dir)
+        _model = model.module
+        _model.wrapped_model = BetterTransformer.reverse(_model.wrapped_model)
+        _model.save_pretrained(save_dir)
+        _model.wrapped_model = BetterTransformer.transform(_model.wrapped_model)
 
         if global_rank == 0:
             optimizer_checkpoint = {
@@ -246,6 +264,7 @@ def save_model_fsdp(model, optimizer, scheduler, training_state_checkpoint, run_
             }
             torch.save(optimizer_checkpoint, f"{save_dir}/optimizer.pt")
 
+            training_state_checkpoint["wandb_id"] = wandb.run.id
             with open(f"{save_dir}/training_state.json", "w") as f:
                 json.dump(training_state_checkpoint, f, indent=4)
 
@@ -310,9 +329,19 @@ def main(args):
     # turn off logger
     if global_rank != 0: logger.remove()
 
+    wandb_id = None
+    if os.path.exists(args.save_dir):
+        if not args.autoresume:
+            raise ValueError(f"Save directory {args.save_dir} already exists and --autoresume is off. Interrupting...")
+
+        training_state, resume_from = training_utils.get_last_training_state(args.save_dir)
+        args.resume_from = resume_from
+        wandb_id = training_state["wandb_id"]
+        logger.info(f"Resuming training from {resume_from} with wandb id {wandb_id}")
+
     # initialize wandb without config (it is passed later)
     if global_rank == 0:
-        wandb.init(project="peft_pretraining", tags=args.tags)
+        wandb.init(project="peft_pretraining", tags=args.tags, id=wandb_id, resume="allow", notes=args.comment)
 
     logger.info(f"Using torch.distributed with rank {global_rank} (only rank 0 will log)")
     logger.info("*" * 40)
@@ -338,18 +367,29 @@ def main(args):
         dataset_preprocessing_args = json.load(f)
     assert dataset_preprocessing_args["sequence_length"] == args.max_length
     # ##############################
+
     tokenizer = AutoTokenizer.from_pretrained(dataset_preprocessing_args["tokenizer"], model_max_length=args.max_length)
 
+    apply_bettertransformer = False
     if args.model_config is not None:
         model_config = AutoConfig.from_pretrained(args.model_config)
         if model_config.vocab_size != tokenizer.vocab_size:
             raise ValueError(f"Model config vocab size ({model_config.vocab_size}) "
                             f"does not match tokenizer vocab size ({tokenizer.vocab_size})")
 
-        model = LlamaForCausalLM(model_config)
+        if isinstance(model_config, LlamaConfig):
+            logger.info("Using local version of LLaMA")
+            model = LlamaForCausalLM(model_config)
+        else:
+            logger.info("!" * 40)
+            logger.info(f"Using HuggingFace model for config type {type(model_config)}")
+            logger.info("!" * 40)
+            model = AutoModelForCausalLM(model_config)
+            apply_bettertransformer = True
     else:
+        logger.info(f"Using HuggingFace model {args.model_name_or_path} revision {args.model_revision}")
         model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, revision=args.model_revision)
-        model = BetterTransformer.transform(model)
+        apply_bettertransformer = True
         model_config = model.config
 
     global_step = 0
@@ -358,16 +398,16 @@ def main(args):
     tokens_seen_before = 0
     n_lora_restarts = 0
 
-    if args.continue_from is not None:
+    if args.warmed_up_model is not None:
         logger.info("*" * 40)
-        logger.info(f"Loading model from {args.continue_from}")
-        checkpoint_path = os.path.join(args.continue_from, "pytorch_model.bin")  # !! won't work with sharded models
+        logger.info(f"Loading a warmed-up model from {args.warmed_up_model}")
+        checkpoint_path = os.path.join(args.warmed_up_model, "pytorch_model.bin")  # !! won't work with sharded models
         model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"), strict=True)
         logger.info(f"Model successfully loaded (strict=True policy)")
 
-        if os.path.exists(os.path.join(args.continue_from, "training_state.json")):
-            logger.info(f"Loading training state like global_step, update_step, and tokens_seen from {args.continue_from}")
-            with open(os.path.join(args.continue_from, "training_state.json")) as f:
+        if os.path.exists(os.path.join(args.warmed_up_model, "training_state.json")):
+            logger.info(f"Loading training state variables like global_step, update_step, and tokens_seen from {args.warmed_up_model} (not optimizer state)")
+            with open(os.path.join(args.warmed_up_model, "training_state.json")) as f:
                 _old_state = json.load(f)
             global_step = _old_state["global_step"]
             update_step = _old_state["update_step"]
@@ -379,53 +419,39 @@ def main(args):
             logger.info(f"tokens_seen_before: {tokens_seen_before}")
             logger.info(f"Will train for {args.num_training_steps - update_step} update steps")
         else:
-            logger.warning(f"Did not find training state in {args.continue_from}, global step will start from zero")
+            logger.warning(f"Did not find training state in {args.warmed_up_model}, global step will start from zero")
         logger.info("*" * 40)
 
     params_before = sum(p.numel() for p in model.parameters())
+    buffers_before = sum(p.numel() for p in model.buffers())
 
     if args.use_peft:
-        for p in model.parameters():
-            p.requires_grad = False
-
         need_linear_weight = args.relora is not None or args.force_keep_original
-        if args.continue_from is not None:
+        if args.warmed_up_model is not None:
             need_linear_weight = True
 
+        # target modules should define all linear layers from transformer block
+        # "attn" and "mlp" are used in LLaMA
+        # "attention" and "mlp" are used in Pythia
         model = ReLoRaModel(
             model,
             r=args.lora_r,
             lora_alpha=32,
             lora_dropout=0.1,
-            target_modules=["attn", "mlp"],
+            target_modules=["attn", "attention", "mlp"],
             trainable_scaling=args.train_scaling,
-            keep_original_weights=args.continue_from is not None,
+            keep_original_weights=args.warmed_up_model is not None or args.force_keep_original,
             lora_only=not need_linear_weight,
         )
 
-        for name, param in model.named_parameters():
-            # LLaMa: model.norm, model.layers.input_layernorm, model.layers.post_attention_layernorm
-            if args.train_ln and "norm" in name:
-                param.requires_grad = True        
-            elif "lm_head" in name:
-                param.requires_grad = True
-            elif "embed_tokens" in name:
-                param.requires_grad = True
-            elif "bias" in name:
-                param.requires_grad = True
-            elif "lora_" in name:
-                param.requires_grad = True
-            else:
-                param.requires_grad = False
-
-    if args.continue_from_peft:
-        logger.info(f"Loading model from {args.continue_from_peft}")
-        checkpoint_path = os.path.join(args.continue_from_peft, "pytorch_model.bin")
+    if args.resume_from:
+        logger.info(f"Loading model from {args.resume_from}")
+        checkpoint_path = os.path.join(args.resume_from, "pytorch_model.bin")
         model.wrapped_model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"), strict=True)
         logger.info(f"Model successfully loaded (strict=True policy)")
 
-        logger.info(f"Loading training state like global_step, update_step, and tokens_seen from {args.continue_from}")
-        with open(os.path.join(args.continue_from_peft, "training_state.json")) as f:
+        logger.info(f"Loading training state like global_step, update_step, and tokens_seen from {args.warmed_up_model}")
+        with open(os.path.join(args.resume_from, "training_state.json")) as f:
             _old_state = json.load(f)
         global_step = _old_state["global_step"]
         update_step = _old_state["update_step"]
@@ -438,13 +464,23 @@ def main(args):
         logger.info(f"tokens_seen_before: {tokens_seen_before}")
         logger.info(f"Will train for {args.num_training_steps - update_step} update steps")
 
+    if apply_bettertransformer:
+        # adds flash attention
+        if isinstance(model, ReLoRaModel):
+            model.wrapped_model = BetterTransformer.transform(model.wrapped_model)
+        else:
+            model = BetterTransformer.transform(model)
+
     params_after = sum(p.numel() for p in model.parameters())
+
+    added_floats = params_after - params_before
 
     # print params and trainable params
     logger.info(f"\n{model}\n")
-    logger.info(f"Total params before LoRA: {params_before / 1_000_000:.2f}M")
-    logger.info(f"Total params after  LoRA: {params_after / 1_000_000:.2f}M")
+    logger.info(f"Total params  before LoRA: {params_before / 1_000_000:.2f}M")
+    logger.info(f"Total params  after  LoRA: {params_after / 1_000_000:.2f}M")
     logger.info(f"Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1_000_000:.2f}M")
+    logger.info(f"In total, added {added_floats / 1_000_000:.2f}M parameters to the model")
 
     logger.info(f"Saving model to {args.save_dir} every {args.save_every} update steps")
 
@@ -457,8 +493,13 @@ def main(args):
     n_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     p_trainable_params = n_trainable_params / n_total_params
 
+    # ##############################
+    # Distributed wrapping
     if args.distributed_type == "fsdp":
         logger.info("Wrapping model with FSDP")
+        raise RuntimeError("FSDP is not supported anymore. "
+                           "There were a lot of isses with ReLoRA and FSDP "
+                           "and no speed or memory improvements.")
         model: Union[FSDP, ReLoRaModel, LlamaForCausalLM] = initialize_fsdp(model, dtype=args.dtype)
 
     elif args.distributed_type == "ddp":
@@ -468,41 +509,16 @@ def main(args):
             device_ids=[args.local_rank],
             output_device=args.local_rank,
         )
-
-    if False and args.distributed_type == "fsdp":  # only for debug
-        logger.info("************************* FSDP device placement *************************")
-        for state_dict_type, state_dict_config in [
-            (StateDictType.FULL_STATE_DICT, FullStateDictConfig()),
-            # (StateDictType.LOCAL_STATE_DICT, LocalStateDictConfig(offload_to_cpu=True)),
-            (StateDictType.SHARDED_STATE_DICT, ShardedStateDictConfig()),
-        ]:
-            with FSDP.state_dict_type(
-                model, state_dict_type, state_dict_config,
-            ):
-                state_dict = model.state_dict()
-                if local_rank == 0:
-                    for k in list(state_dict.keys())[:10]:
-                        tensor = state_dict[k]
-                        if hasattr(tensor, "local_tensor"):
-                            print("Local tensor on rank ", local_rank, ". ", state_dict_type, k, f"F={tensor.shape}, L={tensor.local_tensor().shape}" , type(tensor))
-                        else:
-                            print(state_dict_type, k, tensor.shape, type(tensor))
-                elif local_rank == 1:
-                    time.sleep(2)
-                    for k in list(state_dict.keys())[:10]:
-                        tensor = state_dict[k]
-                        if hasattr(tensor, "local_tensor"):
-                            print("Local tensor on rank ", local_rank, ". ", state_dict_type, k, f"F={tensor.shape}, L={tensor.local_tensor().shape}" , type(tensor))
-                        else:
-                            print(state_dict_type, k, tensor.shape, type(tensor))
-        time.sleep(10)
-        logger.info("********************* end of FSDP device placement ***********************")
+    # ##############################
 
     # Computing the number of parameters is done before wrapping the model with FSDP
     # but gettint the parameters for optimization is done after. This is intentional and doing it other way causes errors.
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     lora_params = [p for n, p in model.named_parameters() if p.requires_grad and "lora_" in n]
     trainable_params_names = [name for name, p in model.named_parameters() if p.requires_grad]
+
+    if args.use_peft and len(lora_params) == 0:
+        raise ValueError("No LoRA parameters found")
 
     # Initialize wandb
     run_config = dict(vars(args))
@@ -542,6 +558,7 @@ def main(args):
         optimizer_state_keys = ["exp_avg", "exp_avg_sq"]
     elif args.optimizer.lower() == "adam_zero":
         optimizer = ZeroRedundancyOptimizer(trainable_params, optimizer_class=torch.optim.Adam, lr=args.lr, weight_decay=args.weight_decay)
+        optimizer_state_keys = ["exp_avg", "exp_avg_sq"]
     else:
         raise ValueError(f"Optimizer {args.optimizer} not supported")
 
@@ -556,16 +573,15 @@ def main(args):
         adjust_step=args.adjust_step,
     )
 
-    if args.continue_from_peft:
+    if args.resume_from:
         logger.info("Setting scheduler to the same state as in the checkpoint")
         for _ in range(update_step):
             scheduler.step()
-        logger.info(f"Scheduler state restored from {args.continue_from_peft}")
+        logger.info(f"Scheduler state restored from {args.resume_from}")
         # current lr
         logger.info(f"Current lr is {optimizer.param_groups[0]['lr']}")
 
-    if args.restore_optimizer:
-        _optimizer_dir = args.continue_from_peft or args.continue_from
+        _optimizer_dir = args.resume_from
         optimizer_checkpoint = torch.load(os.path.join(_optimizer_dir, "optimizer.pt"), map_location="cpu")
         optimizer.load_state_dict(optimizer_checkpoint["optimizer"])
         scheduler.load_state_dict(optimizer_checkpoint["scheduler"])
@@ -598,18 +614,18 @@ def main(args):
         assert pad_idx is not None, "Tokenizer does not have a pad token or eos token"
 
     update_time = time.time()
-    local_step = 0  # when continue_from is used, local_step != global_step
+    local_step = 0  # when warmed_up_model is used, local_step != global_step
 
     # ##############################
     # TRAINING LOOP
-    # we'll never go through all the data, so no need for epochs
+    # we assert above that the dataset is large enough to train for num_training_steps, so no need for epochs
     # ##############################
 
     for batch in train_loader:
         global_step += 1
         local_step += 1
 
-        if update_step > args.num_training_steps:
+        if update_step >= args.num_training_steps:
             logger.info(f"Reached max number of update steps (f{args.num_training_steps}). Stopping training.")
             print(f"Rank {global_rank} stopping training.")
             break
@@ -620,6 +636,11 @@ def main(args):
         tokens_seen += (batch["input_ids"] != pad_idx).sum().item() * world_size
 
         loss = model(**batch, labels=labels).loss
+
+        if global_step == 1 and global_rank == 0:
+            # log loss without any optimization
+            wandb.log({"loss": loss.item(), "update_step": 0}, step=0)
+
         assert not torch.isnan(loss), "Loss is nan"
         scaled_loss = loss / args.gradient_accumulation
         scaled_loss.backward()
@@ -657,7 +678,7 @@ def main(args):
             )
 
         # restart model after we modify the learning rate, so on the next step after the relora frequency
-        can_reset = args.continue_from_peft is not None \
+        can_reset = args.resume_from is not None \
             or (args.relora is not None and local_step * args.gradient_accumulation > args.relora)
 
         if can_reset and update_step % args.relora == 1:
@@ -670,13 +691,6 @@ def main(args):
                 model.apply(merge_and_reinit_functional)
             else:
                 raise ValueError(f"Unknown distributed type {args.distributed_type}")
-
-            if args.reset_optimizer_on_relora:
-                logger.info("Resetting optimizer states to zeros")
-                for p in lora_params:
-                    param_state = optimizer.state[p]
-                    for key in optimizer_state_keys:
-                        param_state[key] = torch.zeros_like(param_state[key])
 
             # check optimizer learning rate
             # scheduler should provide a new warmup after the reset
@@ -691,33 +705,14 @@ def main(args):
                         level=wandb.AlertLevel.WARN,
                     )
 
-            if args.optimizer_random_pruning:
-                logger.info(f"Performing random pruning of optimizer states. Pruning {args.optimizer_random_pruning} percent")
-                n_zeros = 0
-                n_total = 0
-
-                for p in lora_params:
-                    param_state = optimizer.state[p]
-                    reduction = partial(training_utils.random_pruning, prune_ratio=args.optimizer_random_pruning)
-                    for key in optimizer_state_keys:
-                        param_state[key] = reduction(param_state[key])
-
-                logger.info(f"Percent of optimizer states zeroed: {n_zeros / (1e-7 + n_total) * 100:.2f}")
-
-            if args.optimizer_magnitude_pruning:
-                logger.info(f"Performing magnitude pruning of optimizer states. Pruning {args.optimizer_magnitude_pruning} percent")
-                n_zeros = 0
-                n_total = 0
-                for p in lora_params:
-                    param_state = optimizer.state[p]
-                    reduction = partial(training_utils.magnitude_pruning, prune_ratio=args.optimizer_magnitude_pruning)
-                    for key in optimizer_state_keys:
-                        param_state[key] = reduction(param_state[key])
-
-                    n_zeros += (param_state[optimizer_state_keys[0]] == 0).sum()
-                    n_total += param_state[optimizer_state_keys[0]].numel()
-
-                logger.info(f"Percent of optimizer states zeroed: {n_zeros / (1e-7 + n_total) * 100:.2f}")
+            training_utils.optimizer_reset(
+                optimizer,
+                reset_params=lora_params,
+                optimizer_state_keys=optimizer_state_keys,
+                reset_optimizer_on_relora=args.reset_optimizer_on_relora,
+                optimizer_random_pruning=args.optimizer_random_pruning,
+                optimizer_magnitude_pruning=args.optimizer_magnitude_pruning,
+            )
 
         if can_reset and update_step % args.relora == 2:
             logger.info(f"First step after lora reset lr is {optimizer.param_groups[0]['lr']}")
@@ -801,6 +796,7 @@ def main(args):
 
     total_loss, evaluated_on_tokens = evaluate_model(
         model, eval_loader, pad_idx, device,
+        target_eval_tokens=100_000_000,
     )
 
     if global_rank == 0:
@@ -811,6 +807,9 @@ def main(args):
             step=global_step,
         )
         logger.info(f"Final eval loss: {total_loss}")
+
+    if global_rank == 0:
+        wandb.finish()
 
     logger.info("Script finished successfully")
     print(f"Rank {global_rank} finished successfully")

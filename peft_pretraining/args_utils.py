@@ -10,8 +10,13 @@ def check_args_torchrun_main(args):
         raise ValueError("Are you sure? Not training LN is a bad idea.")
 
     if args.save_dir is None:
-        # use checkpoints / model name, date and time as save directory
-        args.save_dir = f"checkpoints/{args.model_config.split('/')[-1].rstrip('.json')}-{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}"
+        if args.model_config is not None:
+            # use checkpoints / model name, date and time as save directory
+            args.save_dir = f"checkpoints/{args.model_config.split('/')[-1].rstrip('.json')}-{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}"
+        elif args.model_name_or_path is not None:
+            args.save_dir = f"checkpoints/{args.model_name_or_path.split('/')[-1]}-{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}"
+        else:
+            raise ValueError("Either --args.save_dir or --model_config or --model_name_or_path must be specified")
 
     if args.tags is not None:
         args.tags = args.tags.split(",")
@@ -32,8 +37,8 @@ def check_args_torchrun_main(args):
         args.num_training_steps = args.max_train_tokens // args.total_batch_size
         logger.info(f"Training for {args.num_training_steps} update steps")
 
-    if args.continue_from is not None:
-        assert os.path.exists(args.continue_from), f"--continue_from={args.continue_from} does not exist"
+    if args.warmed_up_model is not None:
+        assert os.path.exists(args.contwarmed_up_modelinue_from), f"{args.warmed_up_model=} does not exist"
 
     if args.dtype in ["fp16", "float16"]:
         raise NotImplementedError("fp16 is not supported in torchrun_main.py. Use deepspeed_main.py instead (but it seems to have bugs)")
@@ -50,5 +55,12 @@ def check_args_torchrun_main(args):
 
     assert 0 <= args.optimizer_random_pruning < 1, "--optimizer_random_pruning must be between 0 and 1"
     assert 0 <= args.optimizer_magnitude_pruning < 1, "--optimizer_magnitude_pruning must be between 0 and 1"
+
+
+    if args.distributed_type == "fsdp" and args.weight_decay > 0:
+        raise ValueError("FSDP does not support weight decay yet.")
+
+    if args.distributed_type == "fsdp" and "zero" in args.optimizer:
+        raise ValueError("FSDP does zero-optimization by default, do not specify optimizer as zero optimizer.")
 
     return args

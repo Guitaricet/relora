@@ -104,6 +104,7 @@ def tokenize_and_chunk(
         result = {
             k: [t[i : i + block_size] for i in range(0, total_length, block_size)]
             for k, t in concatenated_examples.items()
+            if k != "attention_mask"  # we use flash attention and it does not support padding, so it's best to minimize the dataset storage
         }
         return result
 

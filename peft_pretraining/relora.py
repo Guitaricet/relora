@@ -29,7 +29,6 @@ def merge_and_reinit_functional(module):
     _delta = module.lora_B.weight @ module.lora_A.weight
     _delta = _delta * module._post_lora_scale()
     module.weight.data += _delta
-    module.merged = False
     nn.init.kaiming_uniform_(module.lora_A.weight, a=math.sqrt(5))
 
     nn.init.zeros_(module.lora_B.weight)
@@ -38,7 +37,18 @@ def merge_and_reinit_functional(module):
 
 
 class ReLoRaModel(torch.nn.Module):
-    def __init__(self, model, r, lora_alpha, lora_dropout, target_modules, keep_original_weights=True, lora_only=False, trainable_scaling=False):
+    def __init__(
+        self,
+        model,
+        *,
+        target_modules,
+        r=128,
+        lora_alpha=32,
+        lora_dropout=0.1,
+        keep_original_weights=True,
+        lora_only=False,
+        trainable_scaling=False,
+    ):
         if r <= 0:
             raise ValueError("r must be positive. If you want r == 0, use the original model.")
 
@@ -88,6 +98,10 @@ class ReLoRaModel(torch.nn.Module):
                 new_module.weight.data = module.weight.data
                 if module.bias is not None:
                     new_module.bias.data = module.bias.data
+                # make lora'ed network to be exacty the same as the original network at initialization
+                nn.init.zeros_(new_module.lora_A.weight)
+                assert new_module.lora_A.bias is None
+                assert new_module.lora_B.bias is None
 
             if self.lora_only:
                 assert not self.keep_original_weights
@@ -150,27 +164,22 @@ class ReLoRaLinear(nn.Linear):
         lora_dropout: float = 0.1,
         lora_only: bool = False,
         trainable_scaling: bool = False,
-        bias: bool = True,
+        **kwargs,
     ):
         """Wraps linear layer x W into x W + x W_a @ W_b * lora_alpha / r
         
         Notice that scale = lora_alpha / r.
         """
-        nn.Module.__init__(self)
-
         if r <= 0:
             raise ValueError("r must be positive. If you want r == 0, use the original model.")
 
-        weight = None
-        _bias = None
         if not lora_only:
             # if full model weight + lora weight
-            weight = torch.zeros((out_features, in_features))
-            if bias:
-                _bias = torch.nn.Parameter(torch.zeros(out_features))
-        
-        self.register_buffer("weight", weight)
-        self.register_parameter("bias", _bias)
+            nn.Linear.__init__(self, in_features, out_features, **kwargs)
+        else:
+            nn.Module.__init__(self)
+            self.weight = None
+            self.bias = None
 
         self.in_features = in_features
         self.out_features = out_features
@@ -188,6 +197,9 @@ class ReLoRaLinear(nn.Linear):
             else:
                 self.scaling = self.lora_alpha / self.r
 
+            # Freezing the pre-trained weight matrix
+            if not self.lora_only:
+                self.weight.requires_grad = False
         self.reset_parameters()
 
     def reset_parameters(self):
