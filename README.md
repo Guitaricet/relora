@@ -8,7 +8,7 @@ All requirements are listed in `requirements.txt` and kept up-to-date.
 
 ```bash
 cd peft_pretraining
-pip install -r requirements.txt
+pip install -e .
 ```
 
 ## 1B training script

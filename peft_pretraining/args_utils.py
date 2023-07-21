@@ -44,7 +44,7 @@ def check_args_torchrun_main(args):
         logger.info(f"Training for {args.num_training_steps} update steps")
 
     if args.warmed_up_model is not None:
-        assert os.path.exists(args.contwarmed_up_modelinue_from), f"{args.warmed_up_model=} does not exist"
+        assert os.path.exists(args.warmed_up_model), f"{args.warmed_up_model=} does not exist"
 
     if args.dtype in ["fp16", "float16"]:
         raise NotImplementedError("fp16 is not supported in torchrun_main.py. Use deepspeed_main.py instead (but it seems to have bugs)")

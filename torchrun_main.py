@@ -9,7 +9,6 @@ import json
 import random
 import argparse
 from typing import Union
-from functools import partial
 
 import numpy as np
 
@@ -20,10 +19,8 @@ import torch.distributed as dist
 from torch.distributed.optim import ZeroRedundancyOptimizer
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
-    MixedPrecision,
     StateDictType,
 )
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
 import transformers
 from transformers import (
@@ -53,7 +50,7 @@ transformers.logging.set_verbosity_error()
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--training_config", type=str, default=False, help="Alternative to providing the parameters. Overrides all parameters. Path to a yaml file with training run config")
+    parser.add_argument("--training_config", type=str, default=None, help="Alternative to providing the parameters. Overrides all parameters. Path to a yaml file with training run config")
 
     parser.add_argument("--model_config", type=str, default=None)
     parser.add_argument("--model_name_or_path", type=str, default=None, help="Huggingface model identifier, alternative to --model_config")
@@ -181,35 +178,30 @@ def evaluate_model(model, eval_dataloader, pad_idx, device, target_eval_tokens=1
     return eval_loss, evaluated_on_tokens
 
 
-def initialize_fsdp(model, dtype):
-    wrapping_policy = partial(
-        transformer_auto_wrap_policy,
-        transformer_layer_cls={
-            LlamaDecoderLayer,
-        },
-    )
+def check_and_reverse_better_transformer(_model):
+    """An ugly function that handles cases BetterTransformer/not and ReLoRa/not.
+    
+    We use BetterTransformer for HF models and our versions of LLaMA models use flash attention directly.
+    """
+    if isinstance(_model, ReLoRaModel):
+        if isinstance(_model.wrapped_model, BetterTransformer):
+            _model.wrapped_model = BetterTransformer.reverse(_model.wrapped_model)
+    elif isinstance(_model, BetterTransformer):
+        _model = BetterTransformer.reverse(_model)
+    return _model
 
-    if dtype in ["bf16", "bfloat16"]:
-        mixed_precision_policy = MixedPrecision(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.bfloat16,  # Gradient communication precision
-            buffer_dtype=torch.bfloat16,  # Buffer precision
-        )
-    elif dtype == "float32":
-        mixed_precision_policy = MixedPrecision(
-            param_dtype=torch.float32,
-            reduce_dtype=torch.float32,  # Gradient communication precision
-            buffer_dtype=torch.float32,  # Buffer precision
-        )
-    else:
-        raise ValueError(f"Dtype {dtype} not supported (only float32 and bfloat16 are)")
 
-    model = FSDP(
-        model,
-        mixed_precision=mixed_precision_policy,
-        auto_wrap_policy=wrapping_policy,
-    )
-    return model
+def check_and_transform_better_transformer(_model):
+    """An ugly function that handles cases BetterTransformer/not and ReLoRa/not.
+    
+    We use BetterTransformer for HF models and our versions of LLaMA models use flash attention directly.
+    """
+    if isinstance(_model, ReLoRaModel):
+        if isinstance(_model.wrapped_model, BetterTransformer):
+            _model.wrapped_model = BetterTransformer.transform(_model.wrapped_model)
+    elif isinstance(_model, BetterTransformer):
+        _model = BetterTransformer.transform(_model)
+    return _model
 
 
 def save_model_ddp(model, optimizer, scheduler, training_state_checkpoint, run_config, save_dir):
@@ -221,16 +213,10 @@ def save_model_ddp(model, optimizer, scheduler, training_state_checkpoint, run_c
         os.makedirs(os.path.dirname(save_dir), exist_ok=True)
 
         _model = model.module
-        if isinstance(_model, ReLoRaModel):
-            _model.wrapped_model = BetterTransformer.reverse(_model.wrapped_model)
-        else:
-            _model = BetterTransformer.reverse(_model)
+        _model = check_and_reverse_better_transformer(_model)
 
         _model.save_pretrained(save_dir)
-        if isinstance(_model, ReLoRaModel):
-            _model.wrapped_model = BetterTransformer.transform(_model.wrapped_model)
-        else:
-            _model = BetterTransformer.transform(_model)
+        _model = check_and_transform_better_transformer(_model)
 
     dist.barrier()
     if isinstance(optimizer, ZeroRedundancyOptimizer):
@@ -352,10 +338,27 @@ def main(args):
         if not args.autoresume:
             raise ValueError(f"Save directory {args.save_dir} already exists and --autoresume is off. Interrupting...")
 
+        _old_train_config = os.path.join(args.save_dir, "training_config.yaml")
+        if os.path.exists(_old_train_config):
+            with open(os.path.join(args.save_dir, "training_config.yaml")) as f:
+                old_args = yaml.safe_load(f)
+            if old_args != vars(args):
+                logger.warning(f"Arguments have changed since the last run. Old args: {old_args}")
+                logger.warning(f"Training config will be overwritten with new args")
+        else:
+            logger.warning(f"Training config not found in the existing save directory {args.save_dir}.")
+
         training_state, resume_from = training_utils.get_last_training_state(args.save_dir)
         args.resume_from = resume_from
-        wandb_id = training_state["wandb_id"]
+        if training_state is not None:
+            wandb_id = training_state["wandb_id"]
         logger.info(f"Resuming training from {resume_from} with wandb id {wandb_id}")
+
+    dist.barrier()  # makes sure the directory is not created for other processes
+    if global_rank == 0:
+        os.makedirs(args.save_dir, exist_ok=True)
+        with open(os.path.join(args.save_dir, "training_config.yaml"), "w") as f:
+            yaml.dump(vars(args), f)
 
     # initialize wandb without config (it is passed later)
     if global_rank == 0:
@@ -370,16 +373,17 @@ def main(args):
 
     logger.info("Loading dataset from directory")
     dataset_dict = datasets.load_from_disk(args.dataset_path)
-    dataset_dict.set_format(type='torch', columns=["input_ids", "attention_mask"])
+    dataset_dict.set_format(type='torch', columns=["input_ids"])
 
     train_dataset = dataset_dict["train"]
     eval_dataset = dataset_dict["validation"]
 
     # ##############################
     # Verify dataset
-    minimum_data_size = args.total_batch_size * args.num_training_steps
-    if len(train_dataset) < minimum_data_size:
-        raise ValueError(f"Dataset only has {len(train_dataset)} examples, but we need at least {minimum_data_size}")
+    minimum_n_tokens = args.total_batch_size * args.num_training_steps
+    dataset_n_tokens = len(train_dataset) * args.max_length
+    if dataset_n_tokens < minimum_n_tokens:
+        raise ValueError(f"Dataset only has {dataset_n_tokens} tokens, but we need at least {minimum_n_tokens}")
 
     with open(os.path.join(args.dataset_path, "args.json")) as f:
         dataset_preprocessing_args = json.load(f)
@@ -392,8 +396,11 @@ def main(args):
     if args.model_config is not None:
         model_config = AutoConfig.from_pretrained(args.model_config)
         if model_config.vocab_size != tokenizer.vocab_size:
-            raise ValueError(f"Model config vocab size ({model_config.vocab_size}) "
-                            f"does not match tokenizer vocab size ({tokenizer.vocab_size})")
+            logger.warning(f"Model config vocab size ({model_config.vocab_size}) does not match tokenizer vocab size ({tokenizer.vocab_size})")
+            if model_config.vocab_size == 32000 and tokenizer.vocab_size == 32100:
+                logger.warning("You are most likely reusing old checkpoints. This is alright, but not recommended.")
+            else:
+                raise ValueError(f"Model config vocab size ({model_config.vocab_size}) does not match tokenizer vocab size ({tokenizer.vocab_size})")
 
         if isinstance(model_config, LlamaConfig):
             logger.info("Using local version of LLaMA")
@@ -518,7 +525,7 @@ def main(args):
         raise RuntimeError("FSDP is not supported anymore. "
                            "There were a lot of isses with ReLoRA and FSDP "
                            "and no speed or memory improvements.")
-        model: Union[FSDP, ReLoRaModel, LlamaForCausalLM] = initialize_fsdp(model, dtype=args.dtype)
+        model: Union[FSDP, ReLoRaModel, LlamaForCausalLM] = training_utils.initialize_fsdp(model, dtype=args.dtype)
 
     elif args.distributed_type == "ddp":
         logger.info("Wrapping model with DDP")
@@ -564,7 +571,7 @@ def main(args):
         }
 
     if global_rank == 0:
-        wandb.config.update(run_config)
+        wandb.config.update(run_config, allow_val_change=True)
         wandb.save(os.path.abspath(__file__), policy="now") # save current script
         # fix tqdm visual length to 80 so that the progress bar
         # doesn't jump around when changing from external display to laptop
@@ -574,8 +581,7 @@ def main(args):
     optimizer_kwargs = {
         "lr": args.lr,
         "weight_decay": args.weight_decay,
-        "beta1": args.adam_beta1,
-        "beta2": args.adam_beta2,
+        "betas": (args.adam_beta1, args.adam_beta2),
     }
     if args.optimizer.lower() == "adam":
         optimizer = torch.optim.AdamW(trainable_params, **optimizer_kwargs)
@@ -615,6 +621,15 @@ def main(args):
         scheduler.load_state_dict(optimizer_checkpoint["scheduler"])
         update_step = optimizer_checkpoint["update_step"]
         global_step = optimizer_checkpoint["global_step"]
+
+        # check that batch_size did not change or dataloader rewinding won't work
+        _training_config_path = os.path.join(resume_from, "training_config.yaml")
+        if os.path.exists(_training_config_path):
+            with open(_training_config_path) as f:
+                _old_training_config = yaml.safe_load(f)
+            if args.batch_size != _old_training_config["batch_size"]:
+                raise RuntimeError("Cannot resume from a checkpoint with a different batch size.")
+
         logger.info(f"Optimizer and scheduler restored from {_optimizer_dir}")
 
     train_dataset = datasets.distributed.split_dataset_by_node(train_dataset, rank=global_rank, world_size=world_size)
@@ -635,11 +650,15 @@ def main(args):
     )
 
     # global steps and others are defined above
+    # Warning: even though this part of the code supports pad_idx,
+    # the model does not support padding due to flash attention.
     pad_idx = tokenizer.pad_token_id
     if pad_idx is None:
         logger.warning("Tokenizer does not have a pad token. Using eos_token_id as pad token id")
         pad_idx = tokenizer.eos_token_id
-        assert pad_idx is not None, "Tokenizer does not have a pad token or eos token"
+        if pad_idx is None:
+            logger.warning("Tokenizer does not have a pad token or eos token. Setting pad_idx to -1")
+            pad_idx = -1
 
     update_time = time.time()
     local_step = 0  # when warmed_up_model is used, local_step != global_step
