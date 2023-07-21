@@ -39,29 +39,6 @@ torchrun --nproc-per-node <N_GPUS> --nnodes <N_NODES> \
 torchrun --nproc-per-node 2 \
     torchrun_main.py \
     --training_config training_configs/1B_v1.0.yaml
-    # --dataset_path preprocessed_data/EleutherAI/pile_EleutherAI_gpt-neox-20b_2048 \
-    # --max_length 2048 \
-    # --model_name_or_path EleutherAI/pythia-1b \
-    # --model_revision step10000 \
-    # --use_peft \
-    # --force_keep_original \
-    # --lora_r 128 \
-    # --relora $RELORA_FREQ \
-    # --optimizer adam_zero \
-    # --lr $MAX_LR \
-    # --batch_size $MICROBATCH_SIZE \
-    # --warmup 13_000 \
-    # --scheduler cosine_restarts \
-    # --cycle_length $RELORA_FREQ \
-    # --restart_warmup_steps 100 \
-    # --total_batch_size 1024 \
-    # --num_training_steps 133_000 \
-    # --eval_every 1000 \
-    # --save_every 1000 \
-    # --distributed_type ddp \
-    # --reset_optimizer_on_relora False \
-    # --optimizer_magnitude_pruning 0.9 \
-    # --tags relora1b
 ```
 
 ## Usage
