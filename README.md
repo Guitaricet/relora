@@ -66,19 +66,36 @@ torchrun --nproc-per-node 2 \
 
 ## Usage
 
+Pre-process data (might take some time)
+
+```bash
+python pretokenize.py \
+    --save_dir preprocessed_data \
+    --tokenizer <HF tokenizer name or path> \
+    --dataset <HF dataset id> \
+    --dataset_config <DatasetConfig> \
+    --text_field text \
+    --sequence_length 512
+```
+
+The script will log where the pre-processed data is saved. It should be something like `preprocessed_data/<dataset>_<tokenizer>_<sequence_length>`.
+
 To train a model using ReLoRA, first, perform a warmup through regular training.
 
-Train language model without PEFT
 ```bash
+export DATA_PATH=<path to preprocessed data>
+
 torchrun --nproc-per-node <N_GPUS> torchrun_main.py \
     --model_config configs/llama_250m.json \
+    --dataset_path $DATA_PATH \
     --batch_size 24 \
     --total_batch_size 1152 \
     --lr 5e-4 \
     --max_length 512 \
-    --tags warm_start_250M \
     --save_every 1000 \
+    --eval_every 1000 \
     --num_training_steps 20000
+    --tags warm_start_250M
 ```
 
 > **Reproducibility note:** The way we ran the experiments in the paper was by specifying full num_training_steps, including both the warmup and the ReLoRA training, and stopping it after the desired number of steps was completed. Providing only the number of training steps should work too. The only difference will be the LR schedule during the warmup period.
