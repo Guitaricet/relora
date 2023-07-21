@@ -34,7 +34,6 @@ Relora reset frequency is 5320 so that the number of steps is would be divisible
 
 ```bash
 torchrun --nproc-per-node <N_GPUS> --nnodes <N_NODES> \
-torchrun --nproc-per-node 2 \
     torchrun_main.py \
     --training_config training_configs/1B_v1.0.yaml
 ```
