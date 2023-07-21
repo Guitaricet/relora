@@ -22,8 +22,6 @@ python pretokenize.py \
     --save_dir preprocessed_data
 ```
 
---use_peft --relora 20 --force_keep_original
-
 1. Train the model
 
 The rule of thumb of selecting the learning rate I use for now is 2X regular training learning rate.
