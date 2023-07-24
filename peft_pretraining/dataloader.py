@@ -77,6 +77,7 @@ def tokenize_and_chunk(
     if isinstance(dataset, IterableDataset):
         extra_map_kwargs = {}
 
+    _len_pre = len(dataset)
     # check that text_field is in dataset
     tokenized_dataset = dataset.map(
         lambda example: tokenizer([t + tokenizer.eos_token for t in example[text_field]]),
@@ -88,6 +89,7 @@ def tokenize_and_chunk(
     assert len(tokenized_dataset["train"]) > 0
     logger.info(f"Tokenization finished")
     logger.info(f"\n{tokenized_dataset}")
+    assert len(tokenized_dataset) == _len_pre
 
     block_size = sequence_length
 
@@ -95,7 +97,7 @@ def tokenize_and_chunk(
     def group_texts(examples):
         # Concatenate all texts.
         concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
-        total_length = len(concatenated_examples[list(examples.keys())[0]])
+        total_length = len(concatenated_examples[examples["input_ids"][0]])
         # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
         # customize this part to your needs.
         if total_length >= block_size:
@@ -104,7 +106,7 @@ def tokenize_and_chunk(
         result = {
             k: [t[i : i + block_size] for i in range(0, total_length, block_size)]
             for k, t in concatenated_examples.items()
-            if k != "attention_mask"  # we use flash attention and it does not support padding, so it's best to minimize the dataset storage
+            if k != "attention_mask"  # we never pad for LM, so it's best to minimize the dataset storage
         }
         return result
 

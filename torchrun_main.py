@@ -392,7 +392,6 @@ def main(args):
         dataset_preprocessing_args = json.load(f)
     assert dataset_preprocessing_args["sequence_length"] == args.max_length
     # ##############################
-
     tokenizer = AutoTokenizer.from_pretrained(dataset_preprocessing_args["tokenizer"], model_max_length=args.max_length)
 
     apply_bettertransformer = False
