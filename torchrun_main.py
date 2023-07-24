@@ -154,7 +154,10 @@ def evaluate_model(model, eval_dataloader, pad_idx, device, target_eval_tokens=1
         batch = {k: v.to(device) for k, v in batch.items()}
         labels = batch["input_ids"].clone()
         labels[labels == pad_idx] = -100
-        loss = model(**batch, labels=labels).loss
+
+        # workaround for https://github.com/huggingface/optimum/commit/2678e74df3b9ff020031831f93e7e343a2405a09
+        _attn_mask = torch.ones_like(batch["input_ids"])
+        loss = model(**batch, labels=labels, attention_mask=_attn_mask).loss
         if torch.isnan(ddp_loss_info[0]):
             print(f"Rank {dist.get_rank()} got nan loss. This is probably a bug.")
 
@@ -682,7 +685,9 @@ def main(args):
         labels[labels == pad_idx] = -100
         tokens_seen += (batch["input_ids"] != pad_idx).sum().item() * world_size
 
-        loss = model(**batch, labels=labels).loss
+        # workaround for https://github.com/huggingface/optimum/commit/2678e74df3b9ff020031831f93e7e343a2405a09
+        _attn_mask = torch.ones_like(batch["input_ids"])
+        loss = model(**batch, labels=labels, attention_mask=_attn_mask).loss
 
         if global_step == 1 and global_rank == 0:
             # log loss without any optimization
