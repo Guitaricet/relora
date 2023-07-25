@@ -1,0 +1,15 @@
+cff-version: 1.2.0
+title: "Stack More Layers Differently: High-Rank Training Through Low-Rank Updates"
+version: 1.0.0
+message: "If you use this software, please cite it as below."
+authors:
+  - family-names: "Lialin"
+    given-names: "Vladislav"
+  - family-names: "Shivagunde"
+    given-names: "Namrata"
+  - family-names: "Muckatira"
+    given-names: "Sherin"
+  - family-names: "Rumshisky"
+    given-names: "Anna"
+year: 2023
+repository-code: "https://arxiv.org/abs/2307.05695"
