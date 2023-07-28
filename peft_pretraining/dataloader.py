@@ -97,7 +97,8 @@ def tokenize_and_chunk(
     def group_texts(examples):
         # Concatenate all texts.
         concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
-        total_length = len(concatenated_examples[examples["input_ids"][0]])
+
+        total_length = len(concatenated_examples["input_ids"])
         # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
         # customize this part to your needs.
         if total_length >= block_size:
