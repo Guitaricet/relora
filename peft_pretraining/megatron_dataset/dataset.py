@@ -22,8 +22,11 @@ import os
 import time
 
 import torch
+import torch.distributed as dist
 import numpy as np
 from loguru import logger
+
+
 
 
 class GPT2Dataset(torch.utils.data.Dataset):
@@ -118,9 +121,9 @@ class GPT2Dataset(torch.utils.data.Dataset):
                 samples.append(np.concatenate(sample_list))
 
         if len(datasets) == 1:
-            return {"text": np.array(samples[0], dtype=np.int64)}
+            return {"input_ids": np.array(samples[0], dtype=np.int64)}
 
-        return {"text": np.array(samples[0], dtype=np.int64), "label": np.array(samples[1], dtype=np.int64)}
+        return {"input_ids": np.array(samples[0], dtype=np.int64), "label": np.array(samples[1], dtype=np.int64)}
 
 
 def _build_index_mappings(
@@ -157,8 +160,10 @@ def _build_index_mappings(
 
     if not use_shared_fs:
         should_process_dataset = int(os.environ["LOCAL_RANK"]) == 0
+    elif dist.is_initialized():
+        should_process_dataset = dist.get_rank() == 0
     else:
-        should_process_dataset = torch.distributed.get_rank() == 0
+        should_process_dataset = True
 
     # Build the indexed mapping if not exist.
     if should_process_dataset:
@@ -182,7 +187,7 @@ def _build_index_mappings(
             # sample-idx.
             start_time = time.time()
             # Use C++ implementation for speed.
-            from peft_pretraining import helpers
+            from peft_pretraining.megatron_dataset import helpers
 
             assert doc_idx.dtype == np.int32
             assert sizes.dtype == np.int32
@@ -216,7 +221,8 @@ def _build_index_mappings(
     # device_index=rank which is not the case for model
     # parallel case
     counts = torch.cuda.LongTensor([1])
-    torch.distributed.all_reduce(counts)
+    if dist.is_initialized():
+        dist.all_reduce(counts)
 
     # Load mappings.
     start_time = time.time()

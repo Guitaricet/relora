@@ -1,3 +1,4 @@
+**/*.sbatch
 checkpoints
 **/wandb/**
 wandb

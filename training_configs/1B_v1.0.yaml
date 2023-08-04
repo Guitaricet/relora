@@ -1,14 +1,14 @@
 # dataset
-dataset_path: preprocessed_data/EleutherAI/pile_EleutherAI_gpt-neox-20b_2048
+megatron_dataset_config: configs/pile_megatron_dataset.yaml
 max_length: 2048
-workers: 16
+workers: 8
 
 # model
 model_name_or_path: EleutherAI/pythia-1b
 model_revision: step10000
 
 # saving
-save_dir: checkpoints/relora_1b_July20_2023_run
+save_dir: checkpoints/relora_1b_Aug4_2023_run
 autoresume: true
 
 # ReLoRA

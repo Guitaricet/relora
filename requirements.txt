@@ -8,3 +8,4 @@ loguru
 nvitop
 matplotlib
 optimum
+pybind11

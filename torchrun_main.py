@@ -44,13 +44,17 @@ from peft_pretraining.dataloader import SkipDataLoader
 from peft_pretraining.modeling_llama import LlamaForCausalLM, LlamaDecoderLayer
 from peft_pretraining.relora import ReLoRaModel, ReLoRaLinear, merge_and_reinit_functional
 
+from peft_pretraining.megatron_dataset.arguments import NeoXArgs
+from peft_pretraining.megatron_dataset import data_utils as megatron_data_utils
+
 transformers.logging.set_verbosity_error()
 
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--training_config", type=str, default=None, help="Alternative to providing the parameters. Overrides all parameters. Path to a yaml file with training run config")
+    parser.add_argument("--training_config", type=str, default=None,
+                        help="Alternative to providing the parameters. Overrides all parameters. Path to a yaml file with training run config")
 
     parser.add_argument("--model_config", type=str, default=None)
     parser.add_argument("--model_name_or_path", type=str, default=None, help="Huggingface model identifier, alternative to --model_config")
@@ -59,7 +63,9 @@ def parse_args(args=None):
     parser.add_argument("--resume_from", type=str, default=None, help="Continue training with ReLoRA, loading optimizer and scheduler from the checkpoint.")
 
     parser.add_argument("--dataset_path", type=str, help="Path to a huggingface dataset directory")
-    parser.add_argument("--max_length", type=int, default=256)
+    parser.add_argument("--megatron_dataset_config", type=str, default=None,
+                        help="Path to a megatron dataset config file. Only one of --dataset_path and --megatron_dataset_config should be provided.")
+    parser.add_argument("--max_length", type=int, default=512)
 
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--gradient_accumulation", type=int, default=None)
@@ -115,26 +121,13 @@ def parse_args(args=None):
 
     args = parser.parse_args(args)
 
-    if args.training_config is not None:
-        logger.info(f"Yaml config provided for the run. The file {args.training_config} is used to provide all the parameters.")
-        if len(sys.argv) > 3:
-            logger.error(f"argv length is {len(sys.argv)}")
-            raise RuntimeError(
-                "You provided both a yaml config and command line arguments. "
-                "Please use only one of the two options."
-            )
-        with open(args.training_config) as f:
-            training_config = yaml.safe_load(f)
-        for k, v in training_config.items():
-            setattr(args, k, v)
-
     args = args_utils.check_args_torchrun_main(args)
 
     return args
 
 
 @torch.no_grad()
-def evaluate_model(model, eval_dataloader, pad_idx, device, target_eval_tokens=10_000_000):
+def evaluate_model(model, eval_dataloader, device, target_eval_tokens=10_000_000):
     _time = time.time()
 
     ddp_loss_info = torch.zeros(2).to(device)  # [loss, n_tokens]
@@ -144,24 +137,23 @@ def evaluate_model(model, eval_dataloader, pad_idx, device, target_eval_tokens=1
     for i, batch in enumerate(eval_dataloader):
         if i == 0:
             # this way of estiming the number of eval steps
-            # is needed to avoid a deadlock when using FSDP 
-            tokens_in_batch_info[0] += (batch["input_ids"] != pad_idx).sum().item()
+            # is needed to avoid a deadlock when using FSDP
+            batch["input_ids"]: torch.Tensor
+            tokens_in_batch_info[0] += batch["input_ids"].numel()
             dist.all_reduce(tokens_in_batch_info, op=dist.ReduceOp.SUM)
             n_eval_iters = int(target_eval_tokens / tokens_in_batch_info[0])
 
-        if i > n_eval_iters: break
+        if target_eval_tokens != -1 and i > n_eval_iters: break
 
         batch = {k: v.to(device) for k, v in batch.items()}
-        labels = batch["input_ids"].clone()
-        labels[labels == pad_idx] = -100
 
         # workaround for https://github.com/huggingface/optimum/commit/2678e74df3b9ff020031831f93e7e343a2405a09
-        _attn_mask = torch.ones_like(batch["input_ids"])
-        loss = model(**batch, labels=labels, attention_mask=_attn_mask).loss
+        # _attn_mask = torch.ones_like(batch["input_ids"])
+        loss = model(**batch, labels=batch["input_ids"]).loss
         if torch.isnan(ddp_loss_info[0]):
             print(f"Rank {dist.get_rank()} got nan loss. This is probably a bug.")
 
-        tokens_in_batch = (batch["input_ids"] != pad_idx).sum().item()
+        tokens_in_batch = batch["input_ids"].numel()
         assert tokens_in_batch > 0, "Batch size is zero"
         ddp_loss_info[0] += loss.detach()
         ddp_loss_info[1] += tokens_in_batch
@@ -296,6 +288,49 @@ def save_model(model, *, optimizer, scheduler, training_state_checkpoint, run_co
         raise ValueError(f"Unknown distributed type {distributed_type}")
 
 
+def load_megatron_dataset(args, world_size, start_iteration):
+    logger.info(f"Loading Megatron dataset arguments from {args.megatron_dataset_config}")
+    with open(args.megatron_dataset_config) as f:
+        dataset_config_yaml = yaml.safe_load(f)
+
+    dataset_config_yaml["global_num_gpus"] = world_size
+    dataset_config_yaml["train_micro_batch_size_per_gpu"] = args.batch_size
+    dataset_config_yaml["gas"] = args.gradient_accumulation
+    dataset_config_yaml["num_workers"] = args.workers
+
+    if args.max_length != dataset_config_yaml["seq_length"]:
+        logger.warning(f"rags.max_length ({args.max_length}) does not match "
+                        f"seq_length ({dataset_config_yaml['seq_length']}) in the dataset config")
+        logger.warning(f"Overwriting max_length with seq_length")
+        args.max_length = dataset_config_yaml["seq_length"]
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        dataset_config_yaml["vocab_file"],
+        model_max_length=args.max_length,
+    )
+
+    logger.info("*" * 40)
+    logger.info("Dataset arguments:")
+    for k, v in dataset_config_yaml.items():
+        logger.info(f"{k:30} {v}")
+    logger.info("*" * 40)
+    logger.info("Building Megatron dataset")
+    dataset_args = NeoXArgs.from_dict(dataset_config_yaml)
+
+    if dataset_args.iteration is None:
+        dataset_args.iteration = start_iteration
+
+    if dataset_args.global_batch_size != args.total_batch_size:
+        logger.error(f"global_batch_size ({dataset_args.global_batch_size}) "
+                        f"does not match total_batch_size ({args.total_batch_size})")
+        raise ValueError("global_batch_size must match total_batch_size")
+
+    train_loader, eval_loader, test_loader = megatron_data_utils.\
+        build_train_valid_test_dataloaders(neox_args=dataset_args)
+    logger.info("Megatron dataset built")
+    return train_loader, eval_loader, test_loader, tokenizer
+
+
 def main(args):
     # seed all
     torch.manual_seed(args.seed)
@@ -374,25 +409,44 @@ def main(args):
         logger.info(f"{k:30} {v}")
     logger.info("*" * 40)
 
-    logger.info("Loading dataset from directory")
-    dataset_dict = datasets.load_from_disk(args.dataset_path)
-    dataset_dict.set_format(type='torch', columns=["input_ids"])
+    if args.dataset_path is not None:
+        logger.info("Loading Huggingface dataset from directory")
+        dataset_dict = datasets.load_from_disk(args.dataset_path)
+        dataset_dict.set_format(type='torch', columns=["input_ids"])
 
-    train_dataset = dataset_dict["train"]
-    eval_dataset = dataset_dict["validation"]
+        train_dataset = dataset_dict["train"]
+        eval_dataset = dataset_dict["validation"]
 
-    # ##############################
-    # Verify dataset
-    minimum_n_tokens = args.total_batch_size * args.num_training_steps
-    dataset_n_tokens = len(train_dataset) * args.max_length
-    if dataset_n_tokens < minimum_n_tokens:
-        raise ValueError(f"Dataset only has {dataset_n_tokens} tokens, but we need at least {minimum_n_tokens}")
+        # ##############################
+        # Verify dataset
+        minimum_n_tokens = args.total_batch_size * args.num_training_steps
+        dataset_n_tokens = len(train_dataset) * args.max_length
+        if dataset_n_tokens < minimum_n_tokens:
+            raise ValueError(f"Dataset only has {dataset_n_tokens} tokens, but we need at least {minimum_n_tokens}")
 
-    with open(os.path.join(args.dataset_path, "args.json")) as f:
-        dataset_preprocessing_args = json.load(f)
-    assert dataset_preprocessing_args["sequence_length"] == args.max_length
-    # ##############################
-    tokenizer = AutoTokenizer.from_pretrained(dataset_preprocessing_args["tokenizer"], model_max_length=args.max_length)
+        with open(os.path.join(args.dataset_path, "args.json")) as f:
+            dataset_preprocessing_args = json.load(f)
+        assert dataset_preprocessing_args["sequence_length"] == args.max_length
+        # ##############################
+        tokenizer = AutoTokenizer.from_pretrained(
+            dataset_preprocessing_args["tokenizer"],
+            model_max_length=args.max_length,
+        )
+
+    elif args.megatron_dataset_config is not None:
+        # NOTE: load_megatron_dataset can modify args inplace
+        # NOTE: train_dataset and eval_dataset do not exist in this if-branch
+        # NOTE: we will set iteration to non-zero below in .resume_from
+        start_iteration = 0
+        if args.model_revision.startswith("step"):
+            # This piece of code is VERY SPECIFIC to our experimental setup
+            # of reproducing Pythia training setup and is not useful in regular cases.
+            start_iteration = int(args.model_revision[4:])
+            logger.info(f"Starting from iteration {start_iteration} based on model revision {args.model_revision}")
+        train_loader, eval_loader, test_loader, tokenizer = load_megatron_dataset(args, world_size=world_size, start_iteration=start_iteration)
+        dataset_preprocessing_args = {
+            "tokenizer": tokenizer.name_or_path,
+        }
 
     apply_bettertransformer = False
     if args.model_config is not None:
@@ -450,7 +504,6 @@ def main(args):
         logger.info("*" * 40)
 
     params_before = sum(p.numel() for p in model.parameters())
-    buffers_before = sum(p.numel() for p in model.buffers())
 
     if args.use_peft:
         need_linear_weight = args.relora is not None or args.force_keep_original
@@ -490,6 +543,9 @@ def main(args):
         logger.info(f"tokens_seen       : {tokens_seen}")
         logger.info(f"tokens_seen_before: {tokens_seen_before}")
         logger.info(f"Will train for {args.num_training_steps - update_step} update steps")
+
+        if args.megatron_dataset_config is not None:
+            train_loader.batch_sampler.start_iter = global_step
 
     if apply_bettertransformer:
         # adds flash attention
@@ -634,34 +690,33 @@ def main(args):
 
         logger.info(f"Optimizer and scheduler restored from {_optimizer_dir}")
 
-    train_dataset = datasets.distributed.split_dataset_by_node(train_dataset, rank=global_rank, world_size=world_size)
-    eval_dataset = datasets.distributed.split_dataset_by_node(eval_dataset, rank=global_rank, world_size=world_size)
+    if args.dataset_path is not None:
+        # Huggingface dataset to dataloader
+        train_dataset = datasets.distributed.split_dataset_by_node(train_dataset, rank=global_rank, world_size=world_size)
+        eval_dataset = datasets.distributed.split_dataset_by_node(eval_dataset, rank=global_rank, world_size=world_size)
 
-    train_loader = SkipDataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        collate_fn=default_data_collator,
-        skip_batches=global_step,
-        num_workers=args.workers,
-    )
-    eval_loader = torch.utils.data.DataLoader(
-        eval_dataset,
-        batch_size=args.batch_size,
-        collate_fn=default_data_collator,
-        num_workers=args.workers,
-    )
+        train_loader = SkipDataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            collate_fn=default_data_collator,
+            skip_batches=global_step,
+            num_workers=args.workers,
+        )
+        eval_loader = torch.utils.data.DataLoader(
+            eval_dataset,
+            batch_size=args.batch_size,
+            collate_fn=default_data_collator,
+            num_workers=args.workers,
+        )
+        test_loader = None
+    else:
+        # Megatron dataset to dataloader
+        # Initialized earlier in the script
+        assert args.megatron_dataset_config is not None
+        assert train_loader is not None
+        assert eval_loader is not None
 
     # global steps and others are defined above
-    # Warning: even though this part of the code supports pad_idx,
-    # the model does not support padding due to flash attention.
-    pad_idx = tokenizer.pad_token_id
-    if pad_idx is None:
-        logger.warning("Tokenizer does not have a pad token. Using eos_token_id as pad token id")
-        pad_idx = tokenizer.eos_token_id
-        if pad_idx is None:
-            logger.warning("Tokenizer does not have a pad token or eos token. Setting pad_idx to -1")
-            pad_idx = -1
-
     update_time = time.time()
     local_step = 0  # when warmed_up_model is used, local_step != global_step
 
@@ -680,13 +735,11 @@ def main(args):
             break
 
         batch = {k: v.to(device) for k, v in batch.items()}
-        labels = batch["input_ids"].clone()
-        labels[labels == pad_idx] = -100
-        tokens_seen += (batch["input_ids"] != pad_idx).sum().item() * world_size
+        tokens_seen += batch["input_ids"].numel() * world_size
 
         # workaround for https://github.com/huggingface/optimum/commit/2678e74df3b9ff020031831f93e7e343a2405a09
-        _attn_mask = torch.ones_like(batch["input_ids"])
-        loss = model(**batch, labels=labels, attention_mask=_attn_mask).loss
+        # _attn_mask = torch.ones_like(batch["input_ids"])
+        loss = model(**batch, labels=batch["input_ids"]).loss
 
         if global_step == 1 and global_rank == 0:
             # log loss without any optimization
@@ -771,7 +824,7 @@ def main(args):
         if update_step % args.eval_every == 0:
             logger.info(f"Performing evaluation at step {update_step}")
             total_loss, evaluated_on_tokens = evaluate_model(
-                model, eval_loader, pad_idx, device,
+                model, eval_loader, device,
             )
 
             if global_rank == 0:
@@ -790,7 +843,7 @@ def main(args):
 
         if global_rank == 0:
             wandb.log({
-                "loss": loss.item(),
+                "loss": loss,
                 "lr": lr,
                 "update_step": update_step,
                 "tokens_seen": tokens_seen,
@@ -846,7 +899,7 @@ def main(args):
     torch.cuda.empty_cache()
 
     total_loss, evaluated_on_tokens = evaluate_model(
-        model, eval_loader, pad_idx, device,
+        model, eval_loader, device,
         target_eval_tokens=100_000_000,
     )
 
@@ -858,6 +911,22 @@ def main(args):
             step=global_step,
         )
         logger.info(f"Final eval loss: {total_loss}")
+    
+    if test_loader is not None:
+        logger.info("Running test evaluation (full test set!)")
+        total_loss, evaluated_on_tokens = evaluate_model(
+            model, test_loader, device,
+            target_eval_tokens=-1,
+        )
+
+        if global_rank == 0:
+            wandb.log({
+                "final_test_loss": total_loss,
+                "final_test_tokens": evaluated_on_tokens,
+                },
+                step=global_step,
+            )
+            logger.info(f"Test loss: {total_loss}")
 
     if global_rank == 0:
         wandb.finish()

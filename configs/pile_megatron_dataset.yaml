@@ -1,13 +1,32 @@
 {
-  "global_num_gpus": 2,
+  "global_num_gpus": 8,
   "pipe-parallel-size": 1,
   "model-parallel-size": 1,
+
+  "train_micro_batch_size_per_gpu": 1024,
+  "gas": 1,  # gradient accumulation steps
+  "data-impl": "mmap",
+  "num_workers": 8,
+
+  # path to dataset .bin and .idx file (path should be filenames without `.bin` or `.idx`)
+  "train-data-paths": ["/fsx/pile/pile_20B_tokenizer_text_document"],
+  "valid-data-paths": ["/fsx/pile/pile_20B_tokenizer_text_document"],
+  "test-data-paths": ["/fsx/pile/pile_20B_tokenizer_text_document"],
+
+  "tokenizer-type": "HFTokenizer",
+  "vocab-file": "configs/pythia_tokenizer.json",
+
+  "seq-length": 2048,
+  "train-iters": 143000,
+
+  ############################################################################################
+  # everything below is ignored by the training script, only needed to create neox_args object
+  ############################################################################################
 
   # model settings
   "num-layers": 12,
   "hidden-size": 768,
   "num-attention-heads": 12,
-  "seq-length": 2048,
   "max-position-embeddings": 2048,
   "pos-emb": "rotary",
   "rotary-pct": 0.25,
@@ -43,11 +62,6 @@
     "cpu_offload": False
   },
 
-  "train_micro_batch_size_per_gpu": 1024,
-  "gas": 1,  # gradient accumulation steps
-  "data-impl": "mmap",
-  "num_workers": 8,
-
   # activation checkpointing
   "checkpoint-activations": true,
   "checkpoint-num-layers": 1,
@@ -71,7 +85,6 @@
     "min_loss_scale": 1,
   },
 
-  "train-iters": 143000,
   "lr-decay-iters": 143000,
   "distributed-backend": "nccl",
   "lr-decay-style": "cosine",
@@ -79,13 +92,4 @@
   # "save-interval": 250,
   # "eval-interval": 40000,
   # "eval-iters": 10,
-
-  # path to dataset .bin and .idx file (path should be filenames without `.bin` or `.idx`)
-  "train-data-paths": ["/fsx/pile/pile_20B_tokenizer_text_document"],
-  "valid-data-paths": ["/fsx/pile/pile_20B_tokenizer_text_document"],
-  "test-data-paths": ["/fsx/pile/pile_20B_tokenizer_text_document"],
-
-  "tokenizer-type": "HFTokenizer",
-  "vocab-file": "utils/20B_tokenizer.json",
-
 }

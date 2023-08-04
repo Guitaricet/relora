@@ -34,8 +34,13 @@ def make_data_loader(dataset, batch_size, num_workers):
     if dataset is None:
         return None
     # Data parallel arguments.
-    world_size = dist.get_world_size()
-    rank = dist.get_rank()
+    world_size = 1
+    rank = 0
+    if dist.is_initialized():
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+    else:
+        logger.warning("Not using distributed mode. Should only be used for debugging.")
 
     global_batch_size = batch_size * world_size
 

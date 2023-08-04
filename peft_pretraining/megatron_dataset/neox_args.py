@@ -669,7 +669,7 @@ class NeoXArgsOther(NeoXArgsTemplate):
     user script to be run
     """
 
-    iteration: int = None
+    iteration: int = 0  # Changed from None to 0 (relora-specific, not original neox)
     """
     Set during training
     """

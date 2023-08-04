@@ -45,7 +45,11 @@ class BlendableDataset(torch.utils.data.Dataset):
         self.dataset_index = np.zeros(self.size, dtype=np.uint8)
         self.dataset_sample_index = np.zeros(self.size, dtype=np.int64)
 
-        from peft_pretraining import helpers
+        from peft_pretraining.megatron_dataset import helpers
+
+        rank = 0
+        if torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
 
         helpers.build_blending_indices(
             self.dataset_index,
@@ -53,14 +57,12 @@ class BlendableDataset(torch.utils.data.Dataset):
             weights,
             num_datasets,
             self.size,
-            torch.distributed.get_rank() == 0,
+            rank == 0,
         )
 
         print(
-            "> RANK {} elapsed time for building blendable dataset indices: "
-            "{:.2f} (sec)".format(
-                torch.distributed.get_rank(), time.time() - start_time
-            )
+            f"> RANK {rank} elapsed time for building blendable dataset indices: "
+            f"{time.time() - start_time:.2f} (sec)"
         )
 
     def __len__(self):

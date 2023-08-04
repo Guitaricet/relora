@@ -1,12 +1,17 @@
-import os
+import os, sys
+import yaml
 from datetime import datetime
 
 from loguru import logger
 
 
 def check_args_torchrun_main(args):
-    if args.dataset_path is None:
-        raise ValueError("dataset_path must be specified")
+    if (args.dataset_path is None) ^ (args.megatron_dataset_config is None):
+        raise ValueError("Either --dataset_path or --megatron_dataset_config must be specified and not both")
+
+    if args.megatron_dataset_config is not None:
+        if not os.path.exists(args.megatron_dataset_config):
+            raise ValueError(f"{args.megatron_dataset_config=} does not exist")
 
     if args.batch_size is None:
         raise ValueError("batch_size must be specified")
@@ -73,5 +78,19 @@ def check_args_torchrun_main(args):
         if args.cycle_length is not None and args.cycle_length != args.relora:
             logger.warning(f"Overriding --cycle_length ({args.cycle_length}) to be equal to --relora ({args.relora})")
         args.cycle_length = args.relora
+
+    if args.training_config is not None:
+        logger.info(f"Yaml config provided for the run. The file {args.training_config} is used to provide all the parameters.")
+        if len(sys.argv) > 3:
+            logger.error(f"argv length is {len(sys.argv)}")
+            raise RuntimeError(
+                "You provided both a yaml config and command line arguments. "
+                "Please use only one of the two options."
+            )
+        with open(args.training_config) as f:
+            training_config = yaml.safe_load(f)
+        for k, v in training_config.items():
+            setattr(args, k, v)
+
 
     return args

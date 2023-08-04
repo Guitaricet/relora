@@ -13,13 +13,15 @@
 # limitations under the License.
 
 import math
-import torch
-import numpy as np
 from typing import List, Tuple
 from itertools import zip_longest
 from functools import partial
 
+import torch
+import torch.utils.data
 import torch.distributed as dist
+
+import numpy as np
 from loguru import logger
 
 
@@ -34,8 +36,14 @@ def make_data_loader(dataset, neox_args):
     if dataset is None:
         return None
     # Data parallel arguments.
-    world_size = dist.get_world_size()
-    rank = dist.get_rank()
+    world_size = 1
+    rank = 0
+    if dist.is_initialized():
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+    else:
+        logger.warning("Not using distributed mode. Should only be used for debugging.")
+
     global_batch_size = neox_args.batch_size * world_size
     num_workers = neox_args.num_workers
 
@@ -296,8 +304,8 @@ def weights_by_num_docs(l: list, alpha=0.3):
 
     return weights
 
-
-def build_train_valid_test_data_iterators(neox_args):
+# NOTE: original function was returning iterators, but now we return dataloaders
+def build_train_valid_test_dataloaders(neox_args):
     """XXX"""
 
     (train_dataloader, valid_dataloader, test_dataloader) = (None, None, None)
@@ -456,23 +464,7 @@ def build_train_valid_test_data_iterators(neox_args):
             )
         )
 
-    # Build iterators.
-    if train_dataloader is not None:
-        train_data_iterator = iter(train_dataloader)
-    else:
-        train_data_iterator = None
-
-    if valid_dataloader is not None:
-        valid_data_iterator = iter(valid_dataloader)
-    else:
-        valid_data_iterator = None
-
-    if test_dataloader is not None:
-        test_data_iterator = iter(test_dataloader)
-    else:
-        test_data_iterator = None
-
-    return train_data_iterator, valid_data_iterator, test_data_iterator
+    return train_dataloader, valid_dataloader, test_dataloader
 
 
 def compile_helper():
