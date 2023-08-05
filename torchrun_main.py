@@ -408,11 +408,17 @@ def main(args):
             wandb_id = training_state["wandb_id"]
         logger.info(f"Resuming training from {resume_from} with wandb id {wandb_id}")
 
-    dist.barrier()  # makes sure the directory is created for all processes before proceeding
+    dist.barrier()  # guarantees none of the workers will read save_dir above here before it's created by rank 0
+
     if global_rank == 0:
         os.makedirs(args.save_dir, exist_ok=True)
         with open(os.path.join(args.save_dir, "training_config.yaml"), "w") as f:
             yaml.dump(vars(args), f)
+
+    dist.barrier()  # guarantees that save_dir exists
+    with open(os.path.join(args.save_dir, "training_config.yaml")) as f:
+        rank0_config = yaml.safe_load(f)
+        args.save_dir = rank0_config["save_dir"]
 
     # initialize wandb without config (it is passed later)
     if global_rank == 0:
