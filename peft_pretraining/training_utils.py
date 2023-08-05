@@ -4,6 +4,7 @@ import math
 from functools import partial
 
 import torch
+import torch.distributed as dist
 from torch.optim.lr_scheduler import LambdaLR
 from torch.distributed.optim import ZeroRedundancyOptimizer
 from torch.distributed.fsdp import (
@@ -13,6 +14,7 @@ from torch.distributed.fsdp import (
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
 import transformers
+import wandb
 
 from loguru import logger
 
@@ -345,8 +347,6 @@ def optimizer_reset(
     n_zeros = 0
     n_total = 0
 
-    from torch.optim.optimizer import Optimizer
-
     optimizer_state = optimizer.state
     if isinstance(optimizer, ZeroRedundancyOptimizer):
         optimizer_state = optimizer.optim.state
@@ -362,3 +362,45 @@ def optimizer_reset(
 
     _zeroed = n_zeros / (1e-7 + n_total) * 100
     logger.info(f"Percent of optimizer states zeroed: {_zeroed:.2f}")
+
+
+def print_optimizer_state_size(optimizer):
+    # Count the number of floats in the first and second moments
+    first_moment_count = 0
+    second_moment_count = 0
+
+    optimizer_state = optimizer.state
+    if isinstance(optimizer, ZeroRedundancyOptimizer):
+        optimizer_state = optimizer.optim.state
+
+    for state in optimizer_state.values():
+        if len(state) == 0: # no state for this param, happens for ZeRo optimizer
+            continue
+
+        first_moment_count += torch.numel(state['exp_avg'])
+        second_moment_count += torch.numel(state['exp_avg_sq'])
+
+    logger.info(f'Number of floats in the first moment: {first_moment_count / 1_000_000:.2f}M')
+    logger.info(f'Number of floats in the second moment: {second_moment_count / 1_000_000:.2f}M')
+    global_rank = 0
+    if dist.is_initialized():
+        global_rank = dist.get_rank()
+    if 0 < global_rank < 8:
+        print(f"(Rank {global_rank}) Number of floats in the first moment: {first_moment_count / 1_000_000:.2f}M")
+        print(f"(Rank {global_rank}) Number of floats in the second moment: {second_moment_count / 1_000_000:.2f}M")
+
+
+def check_lr_and_alert(optimizer, max_lr):
+    global_rank = 0 if not dist.is_initialized() else dist.get_rank()
+
+    lr = optimizer.param_groups[0]["lr"]
+    if lr <= max_lr: return
+
+    alert_message = f"Optimizer lr after the reset is large. This can lead to instability. Current lr is {lr}"
+    logger.warning(alert_message)
+    if global_rank == 0:
+        wandb.alert(
+            title="Learning rate issue",
+            text=alert_message,
+            level=wandb.AlertLevel.WARN,
+        )

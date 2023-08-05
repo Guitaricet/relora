@@ -13,17 +13,6 @@ pip install -e .
 
 ## 1B training script
 
-1. Pretokenize the data
-```bash
-python pretokenize.py \
-    --tokenizer EleutherAI/gpt-neox-20b \
-    --dataset EleutherAI/pile \
-    --sequence_length 2048 \
-    --save_dir preprocessed_data
-```
-
-1. Train the model
-
 The rule of thumb of selecting the learning rate I use for now is 2X regular training learning rate.
 It might require tuning on larger models.
 Microbatch size depends on the GPU memory and needs to be tuned to maximize the throughput.
@@ -33,9 +22,7 @@ Number of steps is 143K (Pythia) minus 10K, because we start from the checkpoint
 Relora reset frequency is 5320 so that the number of steps is would be divisible by it.
 
 ```bash
-torchrun --nproc-per-node <N_GPUS> --nnodes <N_NODES> \
-    torchrun_main.py \
-    --training_config training_configs/1B_v1.0.yaml
+torchrun --nproc-per-node 8 --nnodes 1 torchrun_main.py --training_config training_configs/1B_v1.0.yaml
 ```
 
 ## Usage

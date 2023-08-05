@@ -997,9 +997,6 @@ class NeoXArgsTraining(NeoXArgsTemplate):
     Partition Activations across GPUs before checkpointing.
     """
 
-    gas: int = None
-    """gradient_accumulation_steps"""  # TODO this is a duplicate, remove?
-
     clip_grad: float = None
     """
     Gradient clipping based on global L2 norm.

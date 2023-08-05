@@ -30,6 +30,7 @@ from transformers import (
     LlamaConfig,
     default_data_collator,
 )
+from tokenizers import Tokenizer
 from optimum.bettertransformer import BetterTransformer
 
 import datasets
@@ -48,6 +49,8 @@ from peft_pretraining.megatron_dataset.arguments import NeoXArgs
 from peft_pretraining.megatron_dataset import data_utils as megatron_data_utils
 
 transformers.logging.set_verbosity_error()
+FORCE_NO_BETTERTRANSFORMER = False  # DEBUG ONLY
+USING_BETTERTRANSFORMER = True  # this is an ugly global variable, sorry for it
 
 
 def parse_args(args=None):
@@ -62,7 +65,7 @@ def parse_args(args=None):
     parser.add_argument("--warmed_up_model", type=str, default=None, help="Start with warmed-up model weights. Does not restore optimizer and scheduler.")
     parser.add_argument("--resume_from", type=str, default=None, help="Continue training with ReLoRA, loading optimizer and scheduler from the checkpoint.")
 
-    parser.add_argument("--dataset_path", type=str, help="Path to a huggingface dataset directory")
+    parser.add_argument("--dataset_path", type=str, default=None, help="Path to a huggingface dataset directory")
     parser.add_argument("--megatron_dataset_config", type=str, default=None,
                         help="Path to a megatron dataset config file. Only one of --dataset_path and --megatron_dataset_config should be provided.")
     parser.add_argument("--max_length", type=int, default=512)
@@ -147,8 +150,6 @@ def evaluate_model(model, eval_dataloader, device, target_eval_tokens=10_000_000
 
         batch = {k: v.to(device) for k, v in batch.items()}
 
-        # workaround for https://github.com/huggingface/optimum/commit/2678e74df3b9ff020031831f93e7e343a2405a09
-        # _attn_mask = torch.ones_like(batch["input_ids"])
         loss = model(**batch, labels=batch["input_ids"]).loss
         if torch.isnan(ddp_loss_info[0]):
             print(f"Rank {dist.get_rank()} got nan loss. This is probably a bug.")
@@ -178,11 +179,16 @@ def check_and_reverse_better_transformer(_model):
     
     We use BetterTransformer for HF models and our versions of LLaMA models use flash attention directly.
     """
+    if not USING_BETTERTRANSFORMER:
+        return _model
+
     if isinstance(_model, ReLoRaModel):
-        if isinstance(_model.wrapped_model, BetterTransformer):
-            _model.wrapped_model = BetterTransformer.reverse(_model.wrapped_model)
-    elif isinstance(_model, BetterTransformer):
+        logger.info("0 Reversing BetterTransformer")
+        _model.wrapped_model = BetterTransformer.reverse(_model.wrapped_model)
+    else:
+        logger.info("1 Forcefully Reversing BetterTransformer")
         _model = BetterTransformer.reverse(_model)
+
     return _model
 
 
@@ -191,11 +197,14 @@ def check_and_transform_better_transformer(_model):
     
     We use BetterTransformer for HF models and our versions of LLaMA models use flash attention directly.
     """
+    if not USING_BETTERTRANSFORMER:
+        return _model
+
     if isinstance(_model, ReLoRaModel):
-        if isinstance(_model.wrapped_model, BetterTransformer):
-            _model.wrapped_model = BetterTransformer.transform(_model.wrapped_model)
-    elif isinstance(_model, BetterTransformer):
+        _model.wrapped_model = BetterTransformer.transform(_model.wrapped_model)
+    else:
         _model = BetterTransformer.transform(_model)
+
     return _model
 
 
@@ -295,7 +304,8 @@ def load_megatron_dataset(args, world_size, start_iteration):
 
     dataset_config_yaml["global_num_gpus"] = world_size
     dataset_config_yaml["train_micro_batch_size_per_gpu"] = args.batch_size
-    dataset_config_yaml["gas"] = args.gradient_accumulation
+    dataset_config_yaml["gradient_accumulation_steps"] = args.gradient_accumulation
+    dataset_config_yaml["train_batch_size"] = args.total_batch_size
     dataset_config_yaml["num_workers"] = args.workers
 
     if args.max_length != dataset_config_yaml["seq_length"]:
@@ -303,11 +313,12 @@ def load_megatron_dataset(args, world_size, start_iteration):
                         f"seq_length ({dataset_config_yaml['seq_length']}) in the dataset config")
         logger.warning(f"Overwriting max_length with seq_length")
         args.max_length = dataset_config_yaml["seq_length"]
+    
+    if args.num_training_steps > dataset_config_yaml["train_iters"]:
+        logger.error(f"num_training_steps ({args.num_training_steps}) is greater than train_iters ({dataset_config_yaml['train_iters']})")
+        raise ValueError("num_training_steps must be less than train_iters")
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        dataset_config_yaml["vocab_file"],
-        model_max_length=args.max_length,
-    )
+    tokenizer = Tokenizer.from_file(dataset_config_yaml["vocab_file"])
 
     logger.info("*" * 40)
     logger.info("Dataset arguments:")
@@ -320,18 +331,20 @@ def load_megatron_dataset(args, world_size, start_iteration):
     if dataset_args.iteration is None:
         dataset_args.iteration = start_iteration
 
-    if dataset_args.global_batch_size != args.total_batch_size:
-        logger.error(f"global_batch_size ({dataset_args.global_batch_size}) "
+    if dataset_args.train_batch_size != args.total_batch_size:
+        logger.error(f"megatron_dataset_args.train_batch_size ({dataset_args.train_batch_size}) "
                         f"does not match total_batch_size ({args.total_batch_size})")
-        raise ValueError("global_batch_size must match total_batch_size")
+        raise ValueError("megatron_dataset_args.train_batch_size must match total_batch_size")
 
     train_loader, eval_loader, test_loader = megatron_data_utils.\
         build_train_valid_test_dataloaders(neox_args=dataset_args)
     logger.info("Megatron dataset built")
+    tokenizer.name_or_path = dataset_config_yaml["vocab_file"]
     return train_loader, eval_loader, test_loader, tokenizer
 
 
 def main(args):
+    global USING_BETTERTRANSFORMER
     # seed all
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -381,8 +394,12 @@ def main(args):
             with open(os.path.join(args.save_dir, "training_config.yaml")) as f:
                 old_args = yaml.safe_load(f)
             if old_args != vars(args):
-                logger.warning(f"Arguments have changed since the last run. Old args: {old_args}")
+                logger.warning(f"Arguments have changed since the last run.")
                 logger.warning(f"Training config will be overwritten with new args")
+
+                for k, v in vars(args).items():
+                    if old_args[k] != v:
+                        logger.warning(f"{k:30} {old_args[k]} -> {v}")
         else:
             logger.warning(f"Training config not found in the existing save directory {args.save_dir}.")
 
@@ -451,12 +468,14 @@ def main(args):
     apply_bettertransformer = False
     if args.model_config is not None:
         model_config = AutoConfig.from_pretrained(args.model_config)
-        if model_config.vocab_size != tokenizer.vocab_size:
-            logger.warning(f"Model config vocab size ({model_config.vocab_size}) does not match tokenizer vocab size ({tokenizer.vocab_size})")
-            if model_config.vocab_size == 32000 and tokenizer.vocab_size == 32100:
+        t_vocab_size = tokenizer.get_vocab_size() if isinstance(tokenizer, Tokenizer) else tokenizer.vocab_size
+
+        if model_config.vocab_size != t_vocab_size:
+            logger.warning(f"Model config vocab size ({model_config.vocab_size}) does not match tokenizer vocab size ({t_vocab_size})")
+            if model_config.vocab_size == 32000 and t_vocab_size == 32100:
                 logger.warning("You are most likely reusing old checkpoints. This is alright, but not recommended.")
             else:
-                raise ValueError(f"Model config vocab size ({model_config.vocab_size}) does not match tokenizer vocab size ({tokenizer.vocab_size})")
+                raise ValueError(f"Model config vocab size ({model_config.vocab_size}) does not match tokenizer vocab size ({t_vocab_size})")
 
         if isinstance(model_config, LlamaConfig):
             logger.info("Using local version of LLaMA")
@@ -547,12 +566,17 @@ def main(args):
         if args.megatron_dataset_config is not None:
             train_loader.batch_sampler.start_iter = global_step
 
-    if apply_bettertransformer:
+    if apply_bettertransformer and not FORCE_NO_BETTERTRANSFORMER:
         # adds flash attention
         if isinstance(model, ReLoRaModel):
+            logger.info("Applying BetterTransformer to ReLoRaModel")
             model.wrapped_model = BetterTransformer.transform(model.wrapped_model)
         else:
+            logger.info("Applying BetterTransformer to non-ReLoRA model")
             model = BetterTransformer.transform(model)
+    else:
+        logger.warning("Not using BetterTransformer, probably using LLaMA model.")
+        USING_BETTERTRANSFORMER = False  # global variable, TODO: get rid of it
 
     params_after = sum(p.numel() for p in model.parameters())
 
@@ -642,9 +666,11 @@ def main(args):
         "betas": (args.adam_beta1, args.adam_beta2),
     }
     if args.optimizer.lower() == "adam":
+        logger.info("Using Adam optimizer")
         optimizer = torch.optim.AdamW(trainable_params, **optimizer_kwargs)
         optimizer_state_keys = ["exp_avg", "exp_avg_sq"]
     elif args.optimizer.lower() == "adam_zero":
+        logger.info("Using Adam optimizer with ZeRO")
         optimizer = ZeroRedundancyOptimizer(
             trainable_params,
             optimizer_class=torch.optim.AdamW,
@@ -734,11 +760,12 @@ def main(args):
             print(f"Rank {global_rank} stopping training.")
             break
 
+        if global_step == args.gradient_accumulation + 1:
+            training_utils.print_optimizer_state_size(optimizer)  # sanity check
+
         batch = {k: v.to(device) for k, v in batch.items()}
         tokens_seen += batch["input_ids"].numel() * world_size
 
-        # workaround for https://github.com/huggingface/optimum/commit/2678e74df3b9ff020031831f93e7e343a2405a09
-        # _attn_mask = torch.ones_like(batch["input_ids"])
         loss = model(**batch, labels=batch["input_ids"]).loss
 
         if global_step == 1 and global_rank == 0:
@@ -785,8 +812,10 @@ def main(args):
         can_reset = args.resume_from is not None \
             or (args.relora is not None and local_step * args.gradient_accumulation > args.relora)
 
+        # ##############################
+        # MERGE AND REINIT
         if can_reset and update_step % args.relora == 1:
-            logger.info(f"Performing lora reset. Current lr is {optimizer.param_groups[0]['lr']}")
+            logger.info(f"Performing lora reset at update step {update_step}. Current lr is {optimizer.param_groups[0]['lr']}")
             n_lora_restarts += 1
 
             if args.distributed_type == "ddp":
@@ -796,18 +825,8 @@ def main(args):
             else:
                 raise ValueError(f"Unknown distributed type {args.distributed_type}")
 
-            # check optimizer learning rate
             # scheduler should provide a new warmup after the reset
-            lr = optimizer.param_groups[0]["lr"]
-            if lr > 1e-4:
-                alert_message = f"Optimizer lr after the reset is large. This can lead to instability. Current lr is {lr}"
-                logger.warning(alert_message)
-                if global_rank == 0:
-                    wandb.alert(
-                        title="Learning rate issue",
-                        text=alert_message,
-                        level=wandb.AlertLevel.WARN,
-                    )
+            training_utils.check_lr_and_alert(optimizer, max_lr=1e-4)
 
             training_utils.optimizer_reset(
                 optimizer,
@@ -817,15 +836,16 @@ def main(args):
                 optimizer_random_pruning=args.optimizer_random_pruning,
                 optimizer_magnitude_pruning=args.optimizer_magnitude_pruning,
             )
+        # ##############################
 
         if can_reset and update_step % args.relora == 2:
             logger.info(f"First step after lora reset lr is {optimizer.param_groups[0]['lr']}")
 
+        # ##############################
+        # EVALUATION
         if update_step % args.eval_every == 0:
             logger.info(f"Performing evaluation at step {update_step}")
-            total_loss, evaluated_on_tokens = evaluate_model(
-                model, eval_loader, device,
-            )
+            total_loss, evaluated_on_tokens = evaluate_model(model, eval_loader, device)
 
             if global_rank == 0:
                 wandb.log({
@@ -835,6 +855,7 @@ def main(args):
                     step=global_step,
                 )
             logger.info(f"Eval loss at step {update_step}: {total_loss}")
+        # ##############################
 
         lr = optimizer.param_groups[0]["lr"]
         tokens_in_update = tokens_seen - tokens_seen_before

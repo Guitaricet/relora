@@ -21,6 +21,7 @@ import time
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 
 class BlendableDataset(torch.utils.data.Dataset):
@@ -47,23 +48,20 @@ class BlendableDataset(torch.utils.data.Dataset):
 
         from peft_pretraining.megatron_dataset import helpers
 
-        rank = 0
-        if torch.distributed.is_initialized():
-            rank = torch.distributed.get_rank()
-
         helpers.build_blending_indices(
             self.dataset_index,
             self.dataset_sample_index,
             weights,
             num_datasets,
             self.size,
-            rank == 0,
+            False,  # verbose
         )
 
-        print(
-            f"> RANK {rank} elapsed time for building blendable dataset indices: "
-            f"{time.time() - start_time:.2f} (sec)"
-        )
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        _time_delta = time.time() - start_time
+        if _time_delta > 5.0:
+            print(f"> RANK {rank} elapsed time for building blendable dataset indices: "
+                  f"{time.time() - start_time:.2f} (sec)")
 
     def __len__(self):
         return self.size
