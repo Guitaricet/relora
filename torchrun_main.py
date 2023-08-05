@@ -130,10 +130,12 @@ def parse_args(args=None):
 
 
 @torch.no_grad()
-def evaluate_model(model, eval_dataloader, device, target_eval_tokens=10_000_000):
+def evaluate_model(model: nn.Module, eval_dataloader, device, target_eval_tokens=10_000_000):
     _time = time.time()
+    was_training = model.train
+    model.eval()
 
-    ddp_loss_info = torch.zeros(2).to(device)  # [loss, n_tokens]
+    ddp_loss_info = torch.zeros(2).to(device)  # [loss, n_batches, n_tokens]
     tokens_in_batch_info = torch.zeros(1).to(device)
 
     rank = dist.get_rank()
@@ -157,7 +159,8 @@ def evaluate_model(model, eval_dataloader, device, target_eval_tokens=10_000_000
         tokens_in_batch = batch["input_ids"].numel()
         assert tokens_in_batch > 0, "Batch size is zero"
         ddp_loss_info[0] += loss.detach()
-        ddp_loss_info[1] += tokens_in_batch
+        ddp_loss_info[1] += 1
+        ddp_loss_info[2] += tokens_in_batch
 
     # check if loss is nan
     if torch.isnan(ddp_loss_info[0]):
@@ -166,11 +169,12 @@ def evaluate_model(model, eval_dataloader, device, target_eval_tokens=10_000_000
     # Gather losses across all GPUs
     dist.all_reduce(ddp_loss_info, op=dist.ReduceOp.SUM)
     eval_loss = ddp_loss_info[0] / ddp_loss_info[1]
-    evaluated_on_tokens = ddp_loss_info[1].item()
+    evaluated_on_tokens = ddp_loss_info[2].item()
     logger.info(f"Evaluated on {evaluated_on_tokens} tokens, eval loss: {eval_loss:.4f}")
 
     logger.info(f"Evaluation took {time.time() - _time:.2f} seconds")
 
+    if was_training: model.train()
     return eval_loss, evaluated_on_tokens
 
 
@@ -351,21 +355,16 @@ def main(args):
     random.seed(args.seed)
 
     assert "LOCAL_RANK" in os.environ, "torchrun should set LOCAL_RANK"
-    args.local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(args.local_rank)
-    print(f"local rank: {args.local_rank}, device: {torch.cuda.current_device()}")
-
-    # assumes that we are using a single node
-    dist.init_process_group(
-        backend="nccl",
-        rank=args.local_rank,
-        world_size=torch.cuda.device_count()
-    )
-
-    global_rank = dist.get_rank()
-    local_rank = global_rank % torch.cuda.device_count()
-    world_size = dist.get_world_size()
+    global_rank = int(os.environ['RANK'])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(local_rank)
+
+    logger.info(f"Global rank {global_rank}, local rank {local_rank}, device: {torch.cuda.current_device()}")
+
+    dist.init_process_group(backend="nccl", rank=global_rank, world_size=world_size)
+
+    logger.info("Process group initialized")
     device = f"cuda:{local_rank}"
 
     if args.total_batch_size is not None:
@@ -409,7 +408,7 @@ def main(args):
             wandb_id = training_state["wandb_id"]
         logger.info(f"Resuming training from {resume_from} with wandb id {wandb_id}")
 
-    dist.barrier()  # makes sure the directory is not created for other processes
+    dist.barrier()  # makes sure the directory is created for all processes before proceeding
     if global_rank == 0:
         os.makedirs(args.save_dir, exist_ok=True)
         with open(os.path.join(args.save_dir, "training_config.yaml"), "w") as f:
@@ -613,8 +612,8 @@ def main(args):
         logger.info("Wrapping model with DDP")
         model: Union[ReLoRaModel, LlamaForCausalLM] = torch.nn.parallel.DistributedDataParallel(
             model,
-            device_ids=[args.local_rank],
-            output_device=args.local_rank,
+            device_ids=[local_rank],
+            output_device=local_rank,
         )
     # ##############################
 
@@ -655,9 +654,6 @@ def main(args):
     if global_rank == 0:
         wandb.config.update(run_config, allow_val_change=True)
         wandb.save(os.path.abspath(__file__), policy="now") # save current script
-        # fix tqdm visual length to 80 so that the progress bar
-        # doesn't jump around when changing from external display to laptop
-        pbar = tqdm(total=args.num_training_steps - update_step, desc="Update steps", ncols=80)
 
     optimizer_state_keys = None
     optimizer_kwargs = {
@@ -745,11 +741,26 @@ def main(args):
     # global steps and others are defined above
     update_time = time.time()
     local_step = 0  # when warmed_up_model is used, local_step != global_step
+    loss_info = torch.tensor([0.0, 0.0], device=device)  # loss, n_batches
 
     # ##############################
     # TRAINING LOOP
     # we assert above that the dataset is large enough to train for num_training_steps, so no need for epochs
     # ##############################
+
+    prof = None
+    prof = torch.profiler.profile(
+            schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(f"./profiler_logs/{args.save_dir}/rank{global_rank}"),
+            record_shapes=True,
+            with_stack=True)
+    prof.start()
+
+    logger.info(f"Starting training at update step {update_step} with {args.num_training_steps - update_step} update steps")
+    if global_rank == 0:
+        # fix tqdm visual length to 80 so that the progress bar
+        # doesn't jump around when changing from external display to laptop
+        pbar = tqdm(total=args.num_training_steps - update_step, desc="Update steps", ncols=80)
 
     for batch in train_loader:
         global_step += 1
@@ -767,12 +778,15 @@ def main(args):
         tokens_seen += batch["input_ids"].numel() * world_size
 
         loss = model(**batch, labels=batch["input_ids"]).loss
+        assert not torch.isnan(loss), "Loss is nan"
+
+        loss_info[0] += loss.detach()
+        loss_info[1] += 1
 
         if global_step == 1 and global_rank == 0:
             # log loss without any optimization
             wandb.log({"loss": loss.item(), "update_step": 0}, step=0)
 
-        assert not torch.isnan(loss), "Loss is nan"
         scaled_loss = loss / args.gradient_accumulation
         scaled_loss.backward()
 
@@ -862,9 +876,14 @@ def main(args):
         tokens_seen_before = tokens_seen
         batches_in_update = args.gradient_accumulation * world_size
 
+        # log loss without any optimization
+        dist.all_reduce(loss_info, op=dist.ReduceOp.SUM)
+        _loss = loss_info[0] / loss_info[1]
+        loss_info = torch.tensor([0.0, 0.0], device=device)
+
         if global_rank == 0:
             wandb.log({
-                "loss": loss,
+                "loss": _loss,
                 "lr": lr,
                 "update_step": update_step,
                 "tokens_seen": tokens_seen,
@@ -882,9 +901,11 @@ def main(args):
                         all_scaling_factors.append(module.scaling.data.item())
                 wandb.log({"lora_scaling": torch.tensor(all_scaling_factors)}, step=global_step)
         update_time = time.time()
+        if prof is not None: prof.step()
     else: # for-else statement
         logger.warning("Reached the end of the dataset. Training stopped")
 
+    if prof is not None: prof.stop()
     # ##############################
     # END of training loop
     # ##############################
@@ -957,6 +978,5 @@ def main(args):
 
 
 if __name__ == "__main__":
-    print("Starting script")
     args = parse_args()
     main(args)

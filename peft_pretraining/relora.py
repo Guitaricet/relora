@@ -164,7 +164,9 @@ class ReLoRaLinear(nn.Linear):
         lora_dropout: float = 0.1,
         lora_only: bool = False,
         trainable_scaling: bool = False,
-        **kwargs,
+        bias=True,
+        device=None,
+        dtype=None,
     ):
         """Wraps linear layer x W into x W + x W_a @ W_b * lora_alpha / r
         
@@ -175,7 +177,11 @@ class ReLoRaLinear(nn.Linear):
 
         if not lora_only:
             # if full model weight + lora weight
-            nn.Linear.__init__(self, in_features, out_features, **kwargs)
+            nn.Module.__init__(self)
+            self.register_buffer("weight", torch.empty((out_features, in_features), device=device, dtype=dtype))
+            self.bias = None
+            if bias:
+                self.bias = nn.Parameter(torch.zeros(out_features, device=device, dtype=dtype))
         else:
             nn.Module.__init__(self)
             self.weight = None
