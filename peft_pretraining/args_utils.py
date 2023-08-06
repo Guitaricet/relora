@@ -35,15 +35,6 @@ def check_args_torchrun_main(args):
         logger.error("Are you sure? Not training LN is a bad idea.")
         raise ValueError("Are you sure? Not training LN is a bad idea.")
 
-    if args.save_dir is None:
-        if args.model_config is not None:
-            # use checkpoints / model name, date and time as save directory
-            args.save_dir = f"checkpoints/{args.model_config.split('/')[-1].rstrip('.json')}-{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}"
-        elif args.model_name_or_path is not None:
-            args.save_dir = f"checkpoints/{args.model_name_or_path.split('/')[-1]}-{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}"
-        else:
-            raise ValueError("Either --args.save_dir or --model_config or --model_name_or_path must be specified")
-
     if args.tags is not None:
         args.tags = args.tags.split(",")
 

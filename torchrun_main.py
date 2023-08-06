@@ -101,6 +101,7 @@ def parse_args(args=None):
     parser.add_argument("--adam_beta2", type=float, default=0.999)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--warmup_steps", type=int, default=1_000)
+    parser.add_argument("--clip_grad_norm", type=float, default=1.0)
 
     parser.add_argument("--eval_every", type=int, default=1_000)
 
@@ -117,6 +118,7 @@ def parse_args(args=None):
     parser.add_argument("--workers", type=int, default=8)
 
     parser.add_argument("--distributed_type", type=str, default="ddp", choices=["fsdp", "ddp"])
+    parser.add_argument("--profile", default=False, type=lambda x: x.lower() == "true")
     parser.add_argument("--autoresume", default=False, type=lambda x: x.lower() == "true")
     parser.add_argument("--comment", type=str, default=None, help="Wandb notes")
 
@@ -135,7 +137,7 @@ def evaluate_model(model: nn.Module, eval_dataloader, device, target_eval_tokens
     was_training = model.train
     model.eval()
 
-    ddp_loss_info = torch.zeros(2).to(device)  # [loss, n_batches, n_tokens]
+    ddp_loss_info = torch.zeros(3).to(device)  # [loss, n_batches, n_tokens]
     tokens_in_batch_info = torch.zeros(1).to(device)
 
     rank = dist.get_rank()
@@ -347,6 +349,21 @@ def load_megatron_dataset(args, world_size, start_iteration):
     return train_loader, eval_loader, test_loader, tokenizer
 
 
+def maybe_make_profiler(args):
+    if not args.profile: return None
+    profiler_logging_dir = os.path.join(f"profiler_logs/{args.run_name}")
+    prof = torch.profiler.profile(
+        schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(profiler_logging_dir, worker_name=f"rank{global_rank}"),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True,
+    )
+    print(f"Rank {dist.get_rank()} profiling results will be saved to {profiler_logging_dir}")
+    prof.start()
+    return prof
+
+
 def main(args):
     global USING_BETTERTRANSFORMER
     # seed all
@@ -384,7 +401,7 @@ def main(args):
     if global_rank != 0: logger.remove()
 
     wandb_id = None
-    if os.path.exists(args.save_dir):
+    if args.save_dir is not None and os.path.exists(args.save_dir):
         if not args.autoresume:
             raise ValueError(f"Save directory {args.save_dir} already exists and --autoresume is off. Interrupting...")
 
@@ -410,19 +427,26 @@ def main(args):
 
     dist.barrier()  # guarantees none of the workers will read save_dir above here before it's created by rank 0
 
+    # initialize wandb without config (it is passed later)
     if global_rank == 0:
+        wandb.init(project="peft_pretraining", tags=args.tags, id=wandb_id, resume="allow", notes=args.comment)
+        args.run_name = wandb.run.name
+        if args.save_dir is None:
+            args.save_dir = f"checkpoints/{wandb.run.name}"
+
         os.makedirs(args.save_dir, exist_ok=True)
         with open(os.path.join(args.save_dir, "training_config.yaml"), "w") as f:
             yaml.dump(vars(args), f)
 
-    dist.barrier()  # guarantees that save_dir exists
-    with open(os.path.join(args.save_dir, "training_config.yaml")) as f:
-        rank0_config = yaml.safe_load(f)
-        args.save_dir = rank0_config["save_dir"]
+    dist.barrier()  # guarantees that save_dir exists and wand initialized on rank 0
 
-    # initialize wandb without config (it is passed later)
-    if global_rank == 0:
-        wandb.init(project="peft_pretraining", tags=args.tags, id=wandb_id, resume="allow", notes=args.comment)
+    # synchronize run name and save dir across all ranks
+    run_name = [wandb.run.name] if global_rank == 0 else [""]
+    dist.broadcast_object_list(run_name, src=0)
+    run_name = run_name[0]
+    args.run_name = run_name
+    if args.save_dir is None:
+        args.save_dir = f"checkpoints/{args.run_name}"
 
     logger.info(f"Using torch.distributed with rank {global_rank} (only rank 0 will log)")
     logger.info("*" * 40)
@@ -466,9 +490,7 @@ def main(args):
             start_iteration = int(args.model_revision[4:])
             logger.info(f"Starting from iteration {start_iteration} based on model revision {args.model_revision}")
         train_loader, eval_loader, test_loader, tokenizer = load_megatron_dataset(args, world_size=world_size, start_iteration=start_iteration)
-        dataset_preprocessing_args = {
-            "tokenizer": tokenizer.name_or_path,
-        }
+        dataset_preprocessing_args = {"tokenizer": tokenizer.name_or_path}
 
     apply_bettertransformer = False
     if args.model_config is not None:
@@ -754,13 +776,7 @@ def main(args):
     # we assert above that the dataset is large enough to train for num_training_steps, so no need for epochs
     # ##############################
 
-    prof = None
-    prof = torch.profiler.profile(
-            schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(f"./profiler_logs/{args.save_dir}/rank{global_rank}"),
-            record_shapes=True,
-            with_stack=True)
-    prof.start()
+    prof = maybe_make_profiler(args)
 
     logger.info(f"Starting training at update step {update_step} with {args.num_training_steps - update_step} update steps")
     if global_rank == 0:
@@ -777,9 +793,6 @@ def main(args):
             print(f"Rank {global_rank} stopping training.")
             break
 
-        if global_step == args.gradient_accumulation + 1:
-            training_utils.print_optimizer_state_size(optimizer)  # sanity check
-
         batch = {k: v.to(device) for k, v in batch.items()}
         tokens_seen += batch["input_ids"].numel() * world_size
 
@@ -789,7 +802,7 @@ def main(args):
         loss_info[0] += loss.detach()
         loss_info[1] += 1
 
-        if global_step == 1 and global_rank == 0:
+        if global_step == 0 and global_rank == 0:
             # log loss without any optimization
             wandb.log({"loss": loss.item(), "update_step": 0}, step=0)
 
@@ -801,6 +814,10 @@ def main(args):
 
         # The below code is only executed during the update step
         if global_rank == 0: pbar.update(1)
+
+        if args.clip_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(trainable_params, args.clip_grad_norm, error_if_nonfinite=True)
+
         optimizer.step()
         scheduler.step()
         optimizer.zero_grad()
@@ -959,7 +976,7 @@ def main(args):
             step=global_step,
         )
         logger.info(f"Final eval loss: {total_loss}")
-    
+
     if test_loader is not None:
         logger.info("Running test evaluation (full test set!)")
         total_loss, evaluated_on_tokens = evaluate_model(

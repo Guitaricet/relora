@@ -380,14 +380,12 @@ def print_optimizer_state_size(optimizer):
         first_moment_count += torch.numel(state['exp_avg'])
         second_moment_count += torch.numel(state['exp_avg_sq'])
 
-    logger.info(f'Number of floats in the first moment: {first_moment_count / 1_000_000:.2f}M')
-    logger.info(f'Number of floats in the second moment: {second_moment_count / 1_000_000:.2f}M')
     global_rank = 0
     if dist.is_initialized():
         global_rank = dist.get_rank()
-    if 0 < global_rank < 8:
-        print(f"(Rank {global_rank}) Number of floats in the first moment: {first_moment_count / 1_000_000:.2f}M")
-        print(f"(Rank {global_rank}) Number of floats in the second moment: {second_moment_count / 1_000_000:.2f}M")
+
+    print(f"(Rank {global_rank}) Number of floats in the first moment: {first_moment_count / 1_000_000:.2f}M")
+    print(f"(Rank {global_rank}) Number of floats in the second moment: {second_moment_count / 1_000_000:.2f}M")
 
 
 def check_lr_and_alert(optimizer, max_lr):

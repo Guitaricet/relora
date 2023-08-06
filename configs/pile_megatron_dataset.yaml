@@ -3,7 +3,6 @@
   # because we load it from yaml and then feed to NeoXArgs.from_dict().
   # Use _ instead of - in the key names
 
-  "global_num_gpus": 8,
   "pipe_parallel_size": 1,
   "model_parallel_size": 1,
 
