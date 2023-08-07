@@ -31,7 +31,6 @@ from transformers import (
     default_data_collator,
 )
 from tokenizers import Tokenizer
-from optimum.bettertransformer import BetterTransformer
 
 import datasets
 import datasets.distributed
@@ -42,15 +41,14 @@ from loguru import logger
 
 from peft_pretraining import training_utils, args_utils
 from peft_pretraining.dataloader import SkipDataLoader
-from peft_pretraining.modeling_llama import LlamaForCausalLM, LlamaDecoderLayer
+from peft_pretraining.modeling_llama import LlamaForCausalLM
+from peft_pretraining.modeling_pythia import GPTNeoXForCausalLM
 from peft_pretraining.relora import ReLoRaModel, ReLoRaLinear, merge_and_reinit_functional
 
 from peft_pretraining.megatron_dataset.arguments import NeoXArgs
 from peft_pretraining.megatron_dataset import data_utils as megatron_data_utils
 
 transformers.logging.set_verbosity_error()
-FORCE_NO_BETTERTRANSFORMER = False  # DEBUG ONLY
-USING_BETTERTRANSFORMER = True  # this is an ugly global variable, sorry for it
 
 
 def parse_args(args=None):
@@ -83,7 +81,7 @@ def parse_args(args=None):
                         help="Use random pruning to reduce optimizer matrix internal dimensionality.")
     parser.add_argument("--optimizer_magnitude_pruning", default=0.0, type=float,
                         help="Use magnitude pruning to reduce optimizer matrix internal dimensionality.")
-    parser.add_argument("--force_keep_original", default=False, action="store_true",
+    parser.add_argument("--force_keep_original", default=False, type=lambda x: x.lower() == "true",
                         help=("Keep original model parameters even if relora is None. "
                               "Useful for making sure that full-LoRa model is equivalent to model+LoRa."))
 
@@ -180,40 +178,6 @@ def evaluate_model(model: nn.Module, eval_dataloader, device, target_eval_tokens
     return eval_loss, evaluated_on_tokens
 
 
-def check_and_reverse_better_transformer(_model):
-    """An ugly function that handles cases BetterTransformer/not and ReLoRa/not.
-    
-    We use BetterTransformer for HF models and our versions of LLaMA models use flash attention directly.
-    """
-    if not USING_BETTERTRANSFORMER:
-        return _model
-
-    if isinstance(_model, ReLoRaModel):
-        logger.info("0 Reversing BetterTransformer")
-        _model.wrapped_model = BetterTransformer.reverse(_model.wrapped_model)
-    else:
-        logger.info("1 Forcefully Reversing BetterTransformer")
-        _model = BetterTransformer.reverse(_model)
-
-    return _model
-
-
-def check_and_transform_better_transformer(_model):
-    """An ugly function that handles cases BetterTransformer/not and ReLoRa/not.
-    
-    We use BetterTransformer for HF models and our versions of LLaMA models use flash attention directly.
-    """
-    if not USING_BETTERTRANSFORMER:
-        return _model
-
-    if isinstance(_model, ReLoRaModel):
-        _model.wrapped_model = BetterTransformer.transform(_model.wrapped_model)
-    else:
-        _model = BetterTransformer.transform(_model)
-
-    return _model
-
-
 def save_model_ddp(model, optimizer, scheduler, training_state_checkpoint, run_config, save_dir):
     global_rank = dist.get_rank()
     _time = time.time()
@@ -223,10 +187,7 @@ def save_model_ddp(model, optimizer, scheduler, training_state_checkpoint, run_c
         os.makedirs(os.path.dirname(save_dir), exist_ok=True)
 
         _model = model.module
-        _model = check_and_reverse_better_transformer(_model)
-
         _model.save_pretrained(save_dir)
-        _model = check_and_transform_better_transformer(_model)
 
     dist.barrier()
     if isinstance(optimizer, ZeroRedundancyOptimizer):
@@ -262,9 +223,7 @@ def save_model_fsdp(model, optimizer, scheduler, training_state_checkpoint, run_
             os.makedirs(os.path.dirname(save_dir), exist_ok=True)
 
         _model = model.module
-        _model.wrapped_model = BetterTransformer.reverse(_model.wrapped_model)
         _model.save_pretrained(save_dir)
-        _model.wrapped_model = BetterTransformer.transform(_model.wrapped_model)
 
         if global_rank == 0:
             optimizer_checkpoint = {
@@ -351,6 +310,7 @@ def load_megatron_dataset(args, world_size, start_iteration):
 
 def maybe_make_profiler(args):
     if not args.profile: return None
+    global_rank = dist.get_rank()
     profiler_logging_dir = os.path.join(f"profiler_logs/{args.run_name}")
     prof = torch.profiler.profile(
         schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
@@ -359,13 +319,12 @@ def maybe_make_profiler(args):
         profile_memory=True,
         with_stack=True,
     )
-    print(f"Rank {dist.get_rank()} profiling results will be saved to {profiler_logging_dir}")
+    print(f"Rank {global_rank} profiling results will be saved to {profiler_logging_dir}")
     prof.start()
     return prof
 
 
 def main(args):
-    global USING_BETTERTRANSFORMER
     # seed all
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -484,7 +443,7 @@ def main(args):
         # NOTE: train_dataset and eval_dataset do not exist in this if-branch
         # NOTE: we will set iteration to non-zero below in .resume_from
         start_iteration = 0
-        if args.model_revision.startswith("step"):
+        if args.model_revision is not None and args.model_revision.startswith("step"):
             # This piece of code is VERY SPECIFIC to our experimental setup
             # of reproducing Pythia training setup and is not useful in regular cases.
             start_iteration = int(args.model_revision[4:])
@@ -492,7 +451,6 @@ def main(args):
         train_loader, eval_loader, test_loader, tokenizer = load_megatron_dataset(args, world_size=world_size, start_iteration=start_iteration)
         dataset_preprocessing_args = {"tokenizer": tokenizer.name_or_path}
 
-    apply_bettertransformer = False
     if args.model_config is not None:
         model_config = AutoConfig.from_pretrained(args.model_config)
         t_vocab_size = tokenizer.get_vocab_size() if isinstance(tokenizer, Tokenizer) else tokenizer.vocab_size
@@ -508,15 +466,10 @@ def main(args):
             logger.info("Using local version of LLaMA")
             model = LlamaForCausalLM(model_config)
         else:
-            logger.info("!" * 40)
-            logger.info(f"Using HuggingFace model for config type {type(model_config)}")
-            logger.info("!" * 40)
-            model = AutoModelForCausalLM(model_config)
-            apply_bettertransformer = True
+            raise NotImplementedError(f"Unknown model config type {type(model_config)}, only LLaMA is supported")
     else:
         logger.info(f"Using HuggingFace model {args.model_name_or_path} revision {args.model_revision}")
-        model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, revision=args.model_revision)
-        apply_bettertransformer = True
+        model = GPTNeoXForCausalLM.from_pretrained(args.model_name_or_path, revision=args.model_revision)
         model_config = model.config
 
     global_step = 0
@@ -592,18 +545,6 @@ def main(args):
 
         if args.megatron_dataset_config is not None:
             train_loader.batch_sampler.start_iter = global_step
-
-    if apply_bettertransformer and not FORCE_NO_BETTERTRANSFORMER:
-        # adds flash attention
-        if isinstance(model, ReLoRaModel):
-            logger.info("Applying BetterTransformer to ReLoRaModel")
-            model.wrapped_model = BetterTransformer.transform(model.wrapped_model)
-        else:
-            logger.info("Applying BetterTransformer to non-ReLoRA model")
-            model = BetterTransformer.transform(model)
-    else:
-        logger.warning("Not using BetterTransformer, probably using LLaMA model.")
-        USING_BETTERTRANSFORMER = False  # global variable, TODO: get rid of it
 
     params_after = sum(p.numel() for p in model.parameters())
 

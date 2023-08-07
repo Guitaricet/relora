@@ -7,5 +7,6 @@ wandb
 loguru
 nvitop
 matplotlib
-optimum
 pybind11
+bitsandbytes
+scipy

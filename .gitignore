@@ -1,3 +1,4 @@
+profiler_logs
 **/*.sbatch
 checkpoints
 **/wandb/**
