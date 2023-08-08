@@ -7,6 +7,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import bitsandbytes as bnb
+import bitsandbytes.functional as bnbF
 
 from transformers import AutoModelForCausalLM, AutoConfig
 
@@ -20,11 +22,17 @@ class ReLoRaConfig:
     keep_original_weights: bool
     lora_only: bool = False
     trainable_scaling: bool = False
+    quantize4bit: bool = False
+    use_double_quant: bool = False
 
 
 def merge_and_reinit_functional(module):
     if not isinstance(module, ReLoRaLinear):
         return
+
+    if module.quantize4bit:
+        # Look below in merge_and_reinint method for the inspiration on how to implement this
+        raise NotImplementedError("merge_and_reinit_functional for quantize4bit is not implemented yet")
 
     _delta = module.lora_B.weight @ module.lora_A.weight
     _delta = _delta * module._post_lora_scale()
@@ -48,6 +56,8 @@ class ReLoRaModel(torch.nn.Module):
         keep_original_weights=True,
         lora_only=False,
         trainable_scaling=False,
+        quantize4bit=False,
+        use_double_quant=False,
     ):
         if r <= 0:
             raise ValueError("r must be positive. If you want r == 0, use the original model.")
@@ -68,6 +78,8 @@ class ReLoRaModel(torch.nn.Module):
             lora_dropout=lora_dropout,
             target_modules=target_modules,
             keep_original_weights=keep_original_weights,
+            quantize4bit=quantize4bit,
+            use_double_quant=use_double_quant,
         )
 
         # patch methods
@@ -84,6 +96,11 @@ class ReLoRaModel(torch.nn.Module):
             if not any(target_key in module_name for target_key in target_modules_list):
                 continue
 
+            weight_data = module.weight.data if keep_original_weights else None
+            bias_data = None
+            if module.bias is not None:
+                bias_data = module.bias.data if keep_original_weights else None
+
             new_module = ReLoRaLinear(
                 module.in_features,
                 module.out_features,
@@ -93,11 +110,12 @@ class ReLoRaModel(torch.nn.Module):
                 lora_dropout=self.lora_dropout,
                 lora_only=self.lora_only,
                 trainable_scaling=self.trainable_scaling,
+                quantize4bit=quantize4bit,
+                weight_data=weight_data,
+                bias_data=bias_data,
+                bnb_4bit_use_double_quant=use_double_quant,
             )
             if self.keep_original_weights:
-                new_module.weight.data = module.weight.data
-                if module.bias is not None:
-                    new_module.bias.data = module.bias.data
                 # make lora'ed network to be exacty the same as the original network at initialization
                 nn.init.zeros_(new_module.lora_A.weight)
                 assert new_module.lora_A.bias is None
@@ -154,38 +172,56 @@ class ReLoRaModel(torch.nn.Module):
 
 
 # The code is based on https://github.com/microsoft/LoRA/blob/main/loralib/layers.py
-class ReLoRaLinear(nn.Linear):
+class ReLoRaLinear(nn.Module):
     def __init__(
         self,
         in_features: int,
         out_features: int,
         r: int,
+        *,
         lora_alpha: int = 1,
         lora_dropout: float = 0.1,
         lora_only: bool = False,
+        weight_data=None,
+        bias_data=None,
         trainable_scaling: bool = False,
         bias=True,
         device=None,
         dtype=None,
+        quantize4bit=False,
+        bnb_4bit_use_double_quant=False,
+        bnb_4bit_quant_type="nf4",
     ):
         """Wraps linear layer x W into x W + x W_a @ W_b * lora_alpha / r
         
         Notice that scale = lora_alpha / r.
         """
+        nn.Module.__init__(self)
         if r <= 0:
             raise ValueError("r must be positive. If you want r == 0, use the original model.")
 
-        if not lora_only:
-            # if full model weight + lora weight
-            nn.Module.__init__(self)
-            self.register_buffer("weight", torch.empty((out_features, in_features), device=device, dtype=dtype))
-            self.bias = None
-            if bias:
-                self.bias = nn.Parameter(torch.zeros(out_features, device=device, dtype=dtype))
-        else:
-            nn.Module.__init__(self)
+        if lora_only:
             self.weight = None
             self.bias = None
+        else:
+            # if full model weight + lora weight
+            if bias_data is None:
+                bias_data = torch.zeros(out_features, device=device, dtype=dtype, requires_grad=True) if bias else None
+            self.bias = nn.Parameter(bias_data) if bias else None
+
+            if weight_data is None:
+                # note that our trainable weight are W_a and W_b
+                weight_data = torch.zeros(out_features, in_features, device=device, dtype=dtype, requires_grad=False)
+
+            if not quantize4bit:
+                self.weight = nn.Parameter(weight_data, requires_grad=False)
+            else:
+                self.weight = bnb.nn.Params4bit(
+                    weight_data,
+                    requires_grad=False,
+                    compress_statistics=bnb_4bit_use_double_quant,
+                    quant_type=bnb_4bit_quant_type,
+                )
 
         self.in_features = in_features
         self.out_features = out_features
@@ -194,6 +230,7 @@ class ReLoRaLinear(nn.Linear):
         self.lora_dropout = nn.Dropout(p=lora_dropout)
         self.lora_only = lora_only
         self.trainable_scaling = trainable_scaling
+        self.quantize4bit = quantize4bit
 
         if r > 0:
             self.lora_A = nn.Linear(in_features, r, bias=False)
@@ -206,22 +243,6 @@ class ReLoRaLinear(nn.Linear):
             # Freezing the pre-trained weight matrix
             if not self.lora_only:
                 self.weight.requires_grad = False
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        if not hasattr(self, "lora_A"):
-            # we are in nn.Linear calling reset_parameters
-            nn.Linear.reset_parameters(self)
-            return
-
-        if not self.lora_only:
-            nn.init.zeros_(self.weight)
-            if self.bias is not None:
-                nn.init.zeros_(self.bias)
-
-        # disgard original, but now we need to init both A and B with kaiming
-        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
-        nn.init.kaiming_uniform_(self.lora_B.weight, a=math.sqrt(5))
     
     def _post_lora_scale(self):
         if self.trainable_scaling:
@@ -235,8 +256,21 @@ class ReLoRaLinear(nn.Linear):
             print("WARNING: Skipping merge and reinit, because only lora parameters are used")
             return
 
-        self.weight.data += self.lora_B.weight @ self.lora_A.weight * self._post_lora_scale()
-        self.merged = False
+        if not self.quantize4bit:
+            self.weight.weight.data += self.lora_B.weight @ self.lora_A.weight * self._post_lora_scale()
+        else:
+            self.weight: bnb.nn.Params4bit
+            _weight_fp = bnbF.dequantize_4bit(self.weight.data, self.weight.quant_state)
+            _weight_fp += self.lora_B.weight @ self.lora_A.weight * self._post_lora_scale()
+            _weight_4bit, quant_state = bnbF.quantize_4bit(
+                _weight_fp,
+                quant_type=self.weight.quant_type,
+                compress_statistics=self.weight.compress_statistics,
+                quant_type=self.weight.quant_type,
+            )
+            self.weight.data = _weight_4bit
+            self.weight.quant_state = quant_state
+
         nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
 
         nn.init.zeros_(self.lora_B.weight)
@@ -248,7 +282,10 @@ class ReLoRaLinear(nn.Linear):
             # just lora
             return self.lora_B(self.lora_A(self.lora_dropout(x))) * self._post_lora_scale()
 
-        result = F.linear(x, self.weight, bias=self.bias)
+        if not self.quantize4bit:
+            result = F.linear(x, self.weight, bias=self.bias)
+        else:
+            result = bnb.matmul_4bit(x, self.weight.t(), bias=self.bias, quant_state=self.weight.quant_state)
 
         if self.r > 0:
             result += self.lora_B(self.lora_A(self.lora_dropout(x))) * self._post_lora_scale()

@@ -115,6 +115,9 @@ def parse_args(args=None):
     parser.add_argument("--dtype", type=str, default="bfloat16" if torch.cuda.is_bf16_supported() else "float32")
     parser.add_argument("--workers", type=int, default=8)
 
+    parser.add_argument("--quantized", default=False, type=lambda x: x.lower() == "true")
+    parser.add_argument("--use_double_quant", default=True, type=lambda x: x.lower() == "true")
+
     parser.add_argument("--distributed_type", type=str, default="ddp", choices=["fsdp", "ddp"])
     parser.add_argument("--profile", default=False, type=lambda x: x.lower() == "true")
     parser.add_argument("--autoresume", default=False, type=lambda x: x.lower() == "true")
@@ -521,6 +524,8 @@ def main(args):
             trainable_scaling=args.train_scaling,
             keep_original_weights=args.relora or args.force_keep_original,
             lora_only=not need_linear_weight,
+            quantize4bit=args.quantized,
+            use_double_quant=args.use_double_quant,
         )
 
     if args.resume_from:
