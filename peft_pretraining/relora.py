@@ -257,7 +257,7 @@ class ReLoRaLinear(nn.Module):
             return
 
         if not self.quantize4bit:
-            self.weight.weight.data += self.lora_B.weight @ self.lora_A.weight * self._post_lora_scale()
+            self.weight.data += self.lora_B.weight @ self.lora_A.weight * self._post_lora_scale()
         else:
             self.weight: bnb.nn.Params4bit
             _weight_fp = bnbF.dequantize_4bit(self.weight.data, self.weight.quant_state)
