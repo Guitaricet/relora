@@ -266,7 +266,6 @@ class ReLoRaLinear(nn.Module):
                 _weight_fp,
                 quant_type=self.weight.quant_type,
                 compress_statistics=self.weight.compress_statistics,
-                quant_type=self.weight.quant_type,
             )
             self.weight.data = _weight_4bit
             self.weight.quant_state = quant_state
