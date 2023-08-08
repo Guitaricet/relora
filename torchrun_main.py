@@ -12,7 +12,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.utils.data
-import torch.distributed
+import torch.distributed as dist
 
 import transformers
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
@@ -142,7 +142,7 @@ def evaluate_model(model, preprocess_batched, pad_idx, global_rank, world_size, 
 
     # Gather losses across all GPUs
     gathered_losses = [torch.zeros_like(total_loss) for _ in range(world_size)]
-    torch.distributed.all_gather(gathered_losses, total_loss)
+    dist.all_gather(gathered_losses, total_loss)
     total_loss = sum([t.item() for t in gathered_losses]) / world_size
 
     return total_loss, evaluated_on_tokens
@@ -155,20 +155,16 @@ def main(args):
     random.seed(args.seed)
 
     assert "LOCAL_RANK" in os.environ, "torchrun should set LOCAL_RANK"
-    args.local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(args.local_rank)
-    print(f"local rank: {args.local_rank}, device: {torch.cuda.current_device()}")
+    global_rank = int(os.environ['RANK'])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    torch.cuda.set_device(local_rank)
 
-    # assumes that we are using a single node
-    torch.distributed.init_process_group(
-        backend="nccl",
-        rank=args.local_rank,
-        world_size=torch.cuda.device_count()
-    )
+    logger.info(f"Global rank {global_rank}, local rank {local_rank}, device: {torch.cuda.current_device()}")
 
-    global_rank = torch.distributed.get_rank()
-    local_rank = global_rank % torch.cuda.device_count()
-    world_size = torch.distributed.get_world_size()
+    dist.init_process_group(backend="nccl", rank=global_rank, world_size=world_size)
+
+    logger.info("Process group initialized")
     device = f"cuda:{local_rank}"
 
     if args.total_batch_size is not None:
@@ -187,7 +183,7 @@ def main(args):
     if global_rank == 0:
         wandb.init(project="peft_pretraining", tags=args.tags)
 
-    logger.info(f"Using torch.distributed with rank {global_rank} (only rank 0 will log)")
+    logger.info(f"Using dist with rank {global_rank} (only rank 0 will log)")
     logger.info("*" * 40)
     logger.info(f"Starting training with the arguments")
     for k, v in vars(args).items():
@@ -348,8 +344,8 @@ def main(args):
 
     model: Union[ReLoRaModel, LlamaForCausalLM] = torch.nn.parallel.DistributedDataParallel(
         model,
-        device_ids=[args.local_rank],
-        output_device=args.local_rank,
+        device_ids=[local_rank],
+        output_device=local_rank,
         broadcast_buffers=False,
     )
 
