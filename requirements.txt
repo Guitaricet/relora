@@ -10,3 +10,4 @@ matplotlib
 pybind11
 bitsandbytes
 scipy
+evaluate
