@@ -531,7 +531,11 @@ def main(args):
     if args.resume_from:
         logger.info(f"Loading model from {args.resume_from}")
         checkpoint_path = os.path.join(args.resume_from, "pytorch_model.bin")
-        model.wrapped_model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"), strict=True)
+        if isinstance(model, ReLoRaModel):
+            model.wrapped_model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"), strict=True)
+        else:
+            model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"), strict=True)
+
         logger.info(f"Model successfully loaded (strict=True policy)")
 
         logger.info(f"Loading training state like global_step, update_step, and tokens_seen from {args.warmed_up_model}")
@@ -791,10 +795,6 @@ def main(args):
                 save_dir=current_model_directory,
             )
 
-        # restart model after we modify the learning rate, so on the next step after the relora frequency
-        can_reset = args.resume_from is not None \
-            or (args.relora is not None and local_step * args.gradient_accumulation > args.relora)
-
         # ##############################
         # EVALUATION
         if update_step % args.eval_every == 0:
@@ -813,6 +813,13 @@ def main(args):
 
         # ##############################
         # MERGE AND REINIT
+
+        # restart model after we modify the learning rate, so on the next step after the relora frequency
+        can_reset = args.relora is not None and (
+            args.resume_from is not None
+            or local_step * args.gradient_accumulation > args.relora
+        )
+
         if can_reset and update_step % args.relora == 1:
             logger.info(f"Performing lora reset at update step {update_step}. Current lr is {optimizer.param_groups[0]['lr']}")
             n_lora_restarts += 1
@@ -899,7 +906,7 @@ def main(args):
             training_state_checkpoint=training_state_checkpoint,
             run_config=run_config,
             distributed_type=args.distributed_type,
-            save_dir=args.save_dir,
+            save_dir=current_model_directory,
         )
 
     # Final evaluation
