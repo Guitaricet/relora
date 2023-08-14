@@ -5,6 +5,7 @@ checkpoints
 wandb
 ignore
 experimental_data
+fine_tuning_results*
 log
 notebooks/*.pdf
 notebooks/*.png
