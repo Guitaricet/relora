@@ -62,6 +62,9 @@ def parse_args(args=None):
     parser.add_argument("--model_revision", type=str, default=None, help="Tag name, branch name, or commit hash of the model from HuggingFace Hub. E.g., v2.0.1 or step1000")
     parser.add_argument("--warmed_up_model", type=str, default=None, help="Start with warmed-up model weights. Does not restore optimizer and scheduler.")
     parser.add_argument("--resume_from", type=str, default=None, help="Continue training with ReLoRA, loading optimizer and scheduler from the checkpoint.")
+    parser.add_argument("--load_optimizer_state_on_resume", default=True, type=lambda x: x.lower() == "true",
+                        help="Load optimizer state from the checkpoint when resuming training. "
+                             "If False, optimizer state will be initialized from scratch. Setting it to False is useful for some very specific experiments.")
 
     parser.add_argument("--dataset_path", type=str, default=None, help="Path to a huggingface dataset directory")
     parser.add_argument("--megatron_dataset_config", type=str, default=None,
@@ -115,7 +118,7 @@ def parse_args(args=None):
     parser.add_argument("--dtype", type=str, default="bfloat16" if torch.cuda.is_bf16_supported() else "float32")
     parser.add_argument("--workers", type=int, default=8)
 
-    parser.add_argument("--quantized", default=False, type=lambda x: x.lower() == "true")
+    parser.add_argument("--quantize", default=None, type=str, choices=[None, "4bit", "8bit"])
     parser.add_argument("--use_double_quant", default=True, type=lambda x: x.lower() == "true")
 
     parser.add_argument("--distributed_type", type=str, default="ddp", choices=["fsdp", "ddp"])
@@ -376,13 +379,16 @@ def main(args):
                 logger.warning(f"Training config will be overwritten with new args")
 
                 for k, v in vars(args).items():
-                    if old_args[k] != v:
-                        logger.warning(f"{k:30} {old_args[k]} -> {v}")
+                    if old_args.get(k) != v:
+                        logger.warning(f"{k:30} {old_args.get(k)} -> {v}")
         else:
             logger.warning(f"Training config not found in the existing save directory {args.save_dir}.")
 
         training_state, resume_from = training_utils.get_last_training_state(args.save_dir)
-        args.resume_from = resume_from
+
+        if args.resume_from is None:
+            args.resume_from = resume_from
+
         if training_state is not None:
             wandb_id = training_state["wandb_id"]
         logger.info(f"Resuming training from {resume_from} with wandb id {wandb_id}")
@@ -524,7 +530,7 @@ def main(args):
             trainable_scaling=args.train_scaling,
             keep_original_weights=args.relora or args.force_keep_original,
             lora_only=not need_linear_weight,
-            quantize4bit=args.quantized,
+            quantize=args.quantize,
             use_double_quant=args.use_double_quant,
         )
 
@@ -538,7 +544,7 @@ def main(args):
 
         logger.info(f"Model successfully loaded (strict=True policy)")
 
-        logger.info(f"Loading training state like global_step, update_step, and tokens_seen from {args.warmed_up_model}")
+        logger.info(f"Loading training state like global_step, update_step, and tokens_seen from {args.resume_from}")
         with open(os.path.join(args.resume_from, "training_state.json")) as f:
             _old_state = json.load(f)
         global_step = _old_state["global_step"]
@@ -673,22 +679,22 @@ def main(args):
         # current lr
         logger.info(f"Current lr is {optimizer.param_groups[0]['lr']}")
 
-        _optimizer_dir = args.resume_from
-        optimizer_checkpoint = torch.load(os.path.join(_optimizer_dir, "optimizer.pt"), map_location="cpu")
-        optimizer.load_state_dict(optimizer_checkpoint["optimizer"])
-        scheduler.load_state_dict(optimizer_checkpoint["scheduler"])
-        update_step = optimizer_checkpoint["update_step"]
-        global_step = optimizer_checkpoint["global_step"]
+        if args.load_optimizer_state_on_resume:
+            _optimizer_dir = args.resume_from
+            optimizer_checkpoint = torch.load(os.path.join(_optimizer_dir, "optimizer.pt"), map_location="cpu")
+            optimizer.load_state_dict(optimizer_checkpoint["optimizer"])
+            scheduler.load_state_dict(optimizer_checkpoint["scheduler"])
+            update_step = optimizer_checkpoint["update_step"]
+            global_step = optimizer_checkpoint["global_step"]
+            logger.info(f"Optimizer and scheduler restored from {_optimizer_dir}")
 
         # check that batch_size did not change or dataloader rewinding won't work
-        _training_config_path = os.path.join(resume_from, "training_config.yaml")
+        _training_config_path = os.path.join(args.resume_from, "training_config.yaml")
         if os.path.exists(_training_config_path):
             with open(_training_config_path) as f:
                 _old_training_config = yaml.safe_load(f)
             if args.batch_size != _old_training_config["batch_size"]:
                 raise RuntimeError("Cannot resume from a checkpoint with a different batch size.")
-
-        logger.info(f"Optimizer and scheduler restored from {_optimizer_dir}")
 
     if args.dataset_path is not None:
         # Huggingface dataset to dataloader
@@ -739,6 +745,7 @@ def main(args):
         global_step += 1
         local_step += 1
 
+        if local_step == 1: logger.info(f"Starting first step")
         if update_step >= args.num_training_steps:
             logger.info(f"Reached max number of update steps (f{args.num_training_steps}). Stopping training.")
             print(f"Rank {global_rank} stopping training.")
@@ -836,6 +843,7 @@ def main(args):
         )
 
         if can_reset and update_step % args.relora == 1:
+            logger.info(f"{args.resume_from=}, {local_step=}, {args.relora=}, prod: {local_step * args.gradient_accumulation}")
             logger.info(f"Performing lora reset at update step {update_step}. Current lr is {optimizer.param_groups[0]['lr']}")
             n_lora_restarts += 1
 

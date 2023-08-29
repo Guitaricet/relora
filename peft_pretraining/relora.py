@@ -12,6 +12,8 @@ import bitsandbytes.functional as bnbF
 
 from transformers import AutoModelForCausalLM, AutoConfig
 
+from loguru import logger
+
 
 @dataclass
 class ReLoRaConfig:
@@ -22,7 +24,7 @@ class ReLoRaConfig:
     keep_original_weights: bool
     lora_only: bool = False
     trainable_scaling: bool = False
-    quantize4bit: bool = False
+    quantize: str = None
     use_double_quant: bool = False
 
 
@@ -30,9 +32,9 @@ def merge_and_reinit_functional(module):
     if not isinstance(module, ReLoRaLinear):
         return
 
-    if module.quantize4bit:
+    if module.quantize is not None:
         # Look below in merge_and_reinint method for the inspiration on how to implement this
-        raise NotImplementedError("merge_and_reinit_functional for quantize4bit is not implemented yet")
+        raise NotImplementedError("merge_and_reinit_functional for quantized models is not implemented yet. Use non-functional implementation")
 
     _delta = module.lora_B.weight @ module.lora_A.weight
     _delta = _delta * module._post_lora_scale()
@@ -56,7 +58,7 @@ class ReLoRaModel(torch.nn.Module):
         keep_original_weights=True,
         lora_only=False,
         trainable_scaling=False,
-        quantize4bit=False,
+        quantize=None,
         use_double_quant=False,
     ):
         if r <= 0:
@@ -78,7 +80,7 @@ class ReLoRaModel(torch.nn.Module):
             lora_dropout=lora_dropout,
             target_modules=target_modules,
             keep_original_weights=keep_original_weights,
-            quantize4bit=quantize4bit,
+            quantize=quantize,
             use_double_quant=use_double_quant,
         )
 
@@ -110,7 +112,7 @@ class ReLoRaModel(torch.nn.Module):
                 lora_dropout=self.lora_dropout,
                 lora_only=self.lora_only,
                 trainable_scaling=self.trainable_scaling,
-                quantize4bit=quantize4bit,
+                quantize=quantize,
                 weight_data=weight_data,
                 bias_data=bias_data,
                 bnb_4bit_use_double_quant=use_double_quant,
@@ -125,9 +127,13 @@ class ReLoRaModel(torch.nn.Module):
                 assert not self.keep_original_weights
                 module.weight = None
 
+            del module
+
             parent = self._get_parent(module_name)
             module_suffix = module_name.split(".")[-1]
             setattr(parent, module_suffix, new_module)
+
+        torch.cuda.empty_cache()
 
     def _get_parent(self, module_name):
         module_names_list = module_name.split(".")
@@ -139,6 +145,8 @@ class ReLoRaModel(torch.nn.Module):
         for module in self.modules():
             if isinstance(module, ReLoRaLinear):
                 module.merge_and_reinit()
+        logger.info("Performing cuda empty cache")
+        torch.cuda.empty_cache()
 
     def save_pretrained(self, path):
         self.wrapped_model.save_pretrained(path)
@@ -188,7 +196,7 @@ class ReLoRaLinear(nn.Module):
         bias=True,
         device=None,
         dtype=None,
-        quantize4bit=False,
+        quantize=False,
         bnb_4bit_use_double_quant=False,
         bnb_4bit_quant_type="nf4",
     ):
@@ -213,15 +221,23 @@ class ReLoRaLinear(nn.Module):
                 # note that our trainable weight are W_a and W_b
                 weight_data = torch.zeros(out_features, in_features, device=device, dtype=dtype, requires_grad=False)
 
-            if not quantize4bit:
+            if quantize is None:
                 self.weight = nn.Parameter(weight_data, requires_grad=False)
-            else:
+            elif quantize == "4bit":
                 self.weight = bnb.nn.Params4bit(
                     weight_data,
                     requires_grad=False,
                     compress_statistics=bnb_4bit_use_double_quant,
                     quant_type=bnb_4bit_quant_type,
                 )
+            elif quantize == "8bit":
+                logger.warning("Int8 currently does not support merge_and_reinit! It will fail")
+                self.weight = bnb.nn.Int8Params(
+                    weight_data,
+                    requires_grad=False,
+                )
+            else:
+                raise ValueError(f"Unknown quantize type: {quantize}")
 
         self.in_features = in_features
         self.out_features = out_features
@@ -230,7 +246,7 @@ class ReLoRaLinear(nn.Module):
         self.lora_dropout = nn.Dropout(p=lora_dropout)
         self.lora_only = lora_only
         self.trainable_scaling = trainable_scaling
-        self.quantize4bit = quantize4bit
+        self.quantize = quantize
 
         if r > 0:
             self.lora_A = nn.Linear(in_features, r, bias=False)
@@ -256,19 +272,33 @@ class ReLoRaLinear(nn.Module):
             print("WARNING: Skipping merge and reinit, because only lora parameters are used")
             return
 
-        if not self.quantize4bit:
+        if not self.quantize:
             self.weight.data += self.lora_B.weight @ self.lora_A.weight * self._post_lora_scale()
-        else:
+        elif self.quantize == "4bit":
             self.weight: bnb.nn.Params4bit
-            _weight_fp = bnbF.dequantize_4bit(self.weight.data, self.weight.quant_state)
+            _weight_fp = torch.empty(self.weight.data.shape, dtype=self.lora_B.weight.dtype, device=self.weight.data.device)
+            bnbF.dequantize_4bit(self.weight.data, self.weight.quant_state, out=_weight_fp)
             _weight_fp += self.lora_B.weight @ self.lora_A.weight * self._post_lora_scale()
-            _weight_4bit, quant_state = bnbF.quantize_4bit(
+            self.weight.data, self.weight.quant_state = bnbF.quantize_4bit(
                 _weight_fp,
                 quant_type=self.weight.quant_type,
                 compress_statistics=self.weight.compress_statistics,
             )
-            self.weight.data = _weight_4bit
-            self.weight.quant_state = quant_state
+            del _weight_fp
+        elif self.quantize == "8bit":
+            self.weight: bnb.nn.Int8Params
+            _weight_fp = torch.empty(self.weight.data.shape, dtype=torch.bfloat16, device=self.weight.data.device)
+            # !out assigned inplace
+            bnbF.dequantize_blockwise(self.weight.data, self.self.lora_B.weight.dtype, out=_weight_fp)
+            _weight_fp += self.lora_B.weight @ self.lora_A.weight * self._post_lora_scale()
+            self.weight.data, self.weight.quant_state = bnbF.quantize_blockwise(
+                _weight_fp,
+                self.weight.quant_state,
+                out=self.weight.data,
+            )
+            del _weight_fp
+        else:
+            raise ValueError(f"Unknown quantize type: {self.quantize}")
 
         nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
 
@@ -281,10 +311,12 @@ class ReLoRaLinear(nn.Module):
             # just lora
             return self.lora_B(self.lora_A(self.lora_dropout(x))) * self._post_lora_scale()
 
-        if not self.quantize4bit:
-            result = F.linear(x, self.weight, bias=self.bias)
-        else:
+        if self.quantize == "4bit":
             result = bnb.matmul_4bit(x, self.weight.t(), bias=self.bias, quant_state=self.weight.quant_state)
+        elif self.quantize == "8bit":
+            result = bnb.matmul(x, self.weight.t(), bias=self.bias, quant_state=self.weight.quant_state)
+        else:
+            result = F.linear(x, self.weight, bias=self.bias)
 
         if self.r > 0:
             result += self.lora_B(self.lora_A(self.lora_dropout(x))) * self._post_lora_scale()
