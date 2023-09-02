@@ -402,3 +402,17 @@ def check_lr_and_alert(optimizer, max_lr):
             text=alert_message,
             level=wandb.AlertLevel.WARN,
         )
+
+def delete_old_checkpoints(save_dir, keep):
+    if keep is None:
+        return
+
+    checkpoints = [d for d in os.listdir(save_dir) if d.startswith(f"model_")]
+    if len(checkpoints) <= keep:
+        return
+
+    checkpoints = sorted(checkpoints, key=lambda x: int(x.split("_")[-1]))
+    for checkpoint in checkpoints[:-keep]:
+        checkpoint_path = os.path.join(save_dir, checkpoint)
+        logger.info(f"Deleting checkpoint {checkpoint_path}")
+        os.system(f"rm -rf {checkpoint_path}")

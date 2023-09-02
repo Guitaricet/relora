@@ -31,10 +31,6 @@ def check_args_torchrun_main(args):
     if args.batch_size is None:
         raise ValueError("batch_size must be specified")
 
-    if not args.train_ln:
-        logger.error("Are you sure? Not training LN is a bad idea.")
-        raise ValueError("Are you sure? Not training LN is a bad idea.")
-
     if args.tags is not None:
         args.tags = args.tags.split(",")
 

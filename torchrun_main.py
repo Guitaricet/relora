@@ -88,7 +88,6 @@ def parse_args(args=None):
                         help=("Keep original model parameters even if relora is None. "
                               "Useful for making sure that full-LoRa model is equivalent to model+LoRa."))
 
-    parser.add_argument("--train_ln", default=True, action="store_true")
     parser.add_argument("--optimizer", default="Adam", help="Could be adam (for AdamW) or adam_zero for ZeroRedundancyOptimizer(AdamW)")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--scheduler", type=str, default="cosine", choices=["linear", "cosine", "cosine_restarts"])
@@ -114,6 +113,8 @@ def parse_args(args=None):
                              "You can use M and B suffixes, e.g. 100M or 1B.")
     parser.add_argument("--save_every", type=int, default=10_000)
     parser.add_argument("--save_dir", type=str, default=None)
+    parser.add_argument("--keep_checkpoints", type=int, default=None,
+                        help="Number of checkpoints to keep. By default, keep all checkpoints.")
     parser.add_argument("--tags", type=str, default=None)
     parser.add_argument("--dtype", type=str, default="bfloat16" if torch.cuda.is_bf16_supported() else "float32")
     parser.add_argument("--workers", type=int, default=8)
@@ -606,6 +607,13 @@ def main(args):
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     lora_params = [p for n, p in model.named_parameters() if p.requires_grad and "lora_" in n]
     trainable_params_names = [name for name, p in model.named_parameters() if p.requires_grad]
+    non_trainable_params_names = [name for name, p in model.named_parameters() if not p.requires_grad]
+
+    logger.info("*" * 40)
+    logger.info("Non-trainable paramters:")
+    for name in non_trainable_params_names:
+        logger.info(f"{name:40}")
+    logger.info("*" * 40)
 
     if args.use_peft and len(lora_params) == 0:
         raise ValueError("No LoRA parameters found")
@@ -816,6 +824,8 @@ def main(args):
                 distributed_type=args.distributed_type,
                 save_dir=current_model_directory,
             )
+            if args.keep_checkpoints is not None:
+                training_utils.delete_old_checkpoints(args.save_dir, keep=args.keep_checkpoints)
 
         # ##############################
         # EVALUATION
