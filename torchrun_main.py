@@ -870,9 +870,11 @@ def main(args):
             else:
                 raise ValueError(f"Unknown distributed type {args.distributed_type}")
 
+        if can_reset and update_step % args.cycle_length == 1:
             # scheduler should provide a new warmup after the reset
             training_utils.check_lr_and_alert(optimizer, max_lr=1e-4)
 
+            logger.info(f"Performing optimizer reset at update step {update_step}. Current lr is {optimizer.param_groups[0]['lr']}")
             training_utils.optimizer_reset(
                 optimizer,
                 reset_params=lora_params,
