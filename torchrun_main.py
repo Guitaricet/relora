@@ -42,7 +42,6 @@ from loguru import logger
 from peft_pretraining import training_utils, args_utils
 from peft_pretraining.dataloader import SkipDataLoader
 from peft_pretraining.modeling_llama import LlamaForCausalLM
-from peft_pretraining.modeling_llama_flash2 import LlamaForCausalLM as LlamaForCausalLMFlash2
 from peft_pretraining.modeling_pythia import GPTNeoXForCausalLM
 from peft_pretraining.relora import ReLoRaModel, ReLoRaLinear, merge_and_reinit_functional
 
@@ -127,7 +126,6 @@ def parse_args(args=None):
     parser.add_argument("--profile", default=False, type=lambda x: x.lower() == "true")
     parser.add_argument("--autoresume", default=False, type=lambda x: x.lower() == "true")
     parser.add_argument("--comment", type=str, default=None, help="Wandb notes")
-    parser.add_argument("--flash_attention_2", default=False, type=lambda x: x.lower() == "true")
 
     parser.add_argument("--seed", type=int, default=0)
 
@@ -478,11 +476,7 @@ def main(args):
             raise NotImplementedError(f"Unknown model config type {type(model_config)}, only LLaMA is supported")
 
         logger.info("Using local version of LLaMA")
-        if args.flash_attention_2:
-            logger.info("Using Flash Attention 2")
-            model = LlamaForCausalLMFlash2(model_config)
-        else:
-            model = LlamaForCausalLM(model_config)
+        model = LlamaForCausalLM(model_config)
     else:
         logger.info(f"Using HuggingFace model {args.model_name_or_path} revision {args.model_revision}")
         model = GPTNeoXForCausalLM.from_pretrained(args.model_name_or_path, revision=args.model_revision)
@@ -524,6 +518,7 @@ def main(args):
         need_linear_weight = args.relora is not None or args.force_keep_original
         if args.warmed_up_model is not None:
             need_linear_weight = True
+        logger.info(f"Wrapping model with LoRA ({need_linear_weight=})")
 
         # target modules should define all linear layers from transformer block
         # "attn" and "mlp" are used in LLaMA

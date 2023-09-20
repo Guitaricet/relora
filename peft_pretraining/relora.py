@@ -250,7 +250,9 @@ class ReLoRaLinear(nn.Module):
 
         if r > 0:
             self.lora_A = nn.Linear(in_features, r, bias=False)
+            nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
             self.lora_B = nn.Linear(r, out_features, bias=False)
+            nn.init.zeros_(self.lora_B.weight)
             if trainable_scaling:
                 self.scaling = nn.Parameter(torch.tensor([1.]), requires_grad=True)
             else:
