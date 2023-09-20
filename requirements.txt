@@ -11,3 +11,6 @@ pybind11
 bitsandbytes
 scipy
 evaluate
+packaging
+ninja
+flash-attn
