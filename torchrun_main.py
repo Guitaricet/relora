@@ -515,9 +515,11 @@ def main(args):
     params_before = sum(p.numel() for p in model.parameters())
 
     if args.use_peft:
-        need_linear_weight = args.relora is not None or args.force_keep_original
-        if args.warmed_up_model is not None:
-            need_linear_weight = True
+        need_linear_weight = (
+            args.relora is not None
+            or args.force_keep_original
+            or args.warmed_up_model is not None
+        )
         logger.info(f"Wrapping model with LoRA ({need_linear_weight=})")
 
         # target modules should define all linear layers from transformer block
@@ -530,7 +532,7 @@ def main(args):
             lora_dropout=0.1,
             target_modules=["attn", "attention", "mlp"],
             trainable_scaling=args.train_scaling,
-            keep_original_weights=args.relora or args.force_keep_original,
+            keep_original_weights=True,
             lora_only=not need_linear_weight,
             quantize=args.quantize,
             use_double_quant=args.use_double_quant,
