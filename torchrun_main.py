@@ -77,6 +77,7 @@ def parse_args(args=None):
 
     parser.add_argument("--use_peft", default=False, type=lambda x: x.lower() == "true")
     parser.add_argument("--lora_r", type=int, default=128)
+    parser.add_argument("--lora_alpha", type=float, default=32)
     parser.add_argument("--relora", type=int, default=None)
     parser.add_argument("--train_scaling", default=False, action="store_true")
     parser.add_argument("--reset_optimizer_on_relora", default=True, type=lambda x: x.lower() == "true")
@@ -427,26 +428,35 @@ def main(args):
     if args.dataset_path is not None:
         logger.info("Loading Huggingface dataset from directory")
         dataset_dict = datasets.load_from_disk(args.dataset_path)
+        logger.info(f"Applying set_format")
         dataset_dict.set_format(type='torch', columns=["input_ids"])
 
         train_dataset = dataset_dict["train"]
+        if args.seed != 0:
+            # this weird condition is due to backward compatibility
+            train_dataset = train_dataset.shuffle(seed=args.seed)
+
         eval_dataset = dataset_dict["validation"]
 
         # ##############################
         # Verify dataset
+        logger.info("Checking datasets size")
         minimum_n_tokens = args.total_batch_size * args.num_training_steps
         dataset_n_tokens = len(train_dataset) * args.max_length
         if dataset_n_tokens < minimum_n_tokens:
             raise ValueError(f"Dataset only has {dataset_n_tokens} tokens, but we need at least {minimum_n_tokens}")
 
+        logger.info("Loading dataset preprocessing args to check on seq_length")
         with open(os.path.join(args.dataset_path, "args.json")) as f:
             dataset_preprocessing_args = json.load(f)
         assert dataset_preprocessing_args["sequence_length"] == args.max_length
+        logger.info("All good! Loading tokenizer now")
         # ##############################
         tokenizer = AutoTokenizer.from_pretrained(
             dataset_preprocessing_args["tokenizer"],
             model_max_length=args.max_length,
         )
+        logger.info("Tokenizer loaded")
 
     elif args.megatron_dataset_config is not None:
         # NOTE: load_megatron_dataset can modify args inplace
@@ -528,7 +538,7 @@ def main(args):
         model = ReLoRaModel(
             model,
             r=args.lora_r,
-            lora_alpha=32,
+            lora_alpha=args.lora_alpha,
             lora_dropout=0.1,
             target_modules=["attn", "attention", "mlp"],
             trainable_scaling=args.train_scaling,
@@ -604,6 +614,10 @@ def main(args):
             output_device=local_rank,
         )
     # ##############################
+    if global_rank == 0:
+        _log_freq = 500
+        logger.info(f"Tracking model gradients with wandb every {_log_freq} update steps")
+        wandb.watch(model, log_freq=_log_freq)
 
     # Computing the number of parameters is done before wrapping the model with FSDP
     # but gettint the parameters for optimization is done after. This is intentional and doing it other way causes errors.
@@ -785,7 +799,9 @@ def main(args):
         if global_rank == 0: pbar.update(1)
 
         if args.clip_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(trainable_params, args.clip_grad_norm, error_if_nonfinite=True)
+            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, args.clip_grad_norm, error_if_nonfinite=True)
+            if global_rank == 0:
+                wandb.log({"grad_norm": grad_norm.item()}, step=global_step)
 
         dist.all_reduce(loss_info, op=dist.ReduceOp.SUM)
         _loss = loss_info[0] / loss_info[1]  # loss to log in wandb below
