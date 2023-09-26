@@ -145,8 +145,6 @@ class ReLoRaModel(torch.nn.Module):
         for module in self.modules():
             if isinstance(module, ReLoRaLinear):
                 module.merge_and_reinit()
-        logger.info("Performing cuda empty cache")
-        torch.cuda.empty_cache()
 
     def save_pretrained(self, path):
         self.wrapped_model.save_pretrained(path)
