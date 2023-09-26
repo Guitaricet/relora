@@ -127,6 +127,8 @@ def parse_args(args=None):
     parser.add_argument("--profile", default=False, type=lambda x: x.lower() == "true")
     parser.add_argument("--autoresume", default=False, type=lambda x: x.lower() == "true")
     parser.add_argument("--comment", type=str, default=None, help="Wandb notes")
+    parser.add_argument("--wandb_watch", default=False, type=lambda x: x.lower() == "true",
+                        help="Enable wandb.watch (may make training unstable, but might be good for understanding gradients)")
 
     parser.add_argument("--seed", type=int, default=0)
 
@@ -614,7 +616,7 @@ def main(args):
             output_device=local_rank,
         )
     # ##############################
-    if global_rank == 0:
+    if args.wandb_watch and global_rank == 0:
         _log_freq = 500
         logger.info(f"Tracking model gradients with wandb every {_log_freq} update steps")
         wandb.watch(model, log_freq=_log_freq)
