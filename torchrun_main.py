@@ -728,6 +728,7 @@ def main(args):
         train_dataset = datasets.distributed.split_dataset_by_node(train_dataset, rank=global_rank, world_size=world_size)
         eval_dataset = datasets.distributed.split_dataset_by_node(eval_dataset, rank=global_rank, world_size=world_size)
 
+        logger.info(f"Skipping the first {global_step} batches")
         train_loader = SkipDataLoader(
             train_dataset,
             batch_size=args.batch_size,
@@ -868,12 +869,12 @@ def main(args):
         # MERGE AND REINIT
 
         # restart model after we modify the learning rate, so on the next step after the relora frequency
-        can_reset = args.relora is not None and (
+        can_reset_relora = args.relora is not None and (
             args.resume_from is not None
             or local_step * args.gradient_accumulation > args.relora
         )
 
-        if can_reset and update_step % args.relora == 1:
+        if can_reset_relora and update_step % args.relora == 1:
             logger.info(f"{args.resume_from=}, {local_step=}, {args.relora=}, prod: {local_step * args.gradient_accumulation}")
             logger.info(f"Performing lora reset at update step {update_step}. Current lr is {optimizer.param_groups[0]['lr']}")
             n_lora_restarts += 1
@@ -885,7 +886,12 @@ def main(args):
             else:
                 raise ValueError(f"Unknown distributed type {args.distributed_type}")
 
-        if can_reset and update_step % args.cycle_length == 1:
+        can_reset_optimizer = args.relora is not None and (
+            args.resume_from is not None
+            or local_step * args.gradient_accumulation > args.cycle_length
+        )
+
+        if can_reset_optimizer and update_step % args.cycle_length == 1:
             # scheduler should provide a new warmup after the reset
             training_utils.check_lr_and_alert(optimizer, max_lr=1e-4)
 
@@ -900,8 +906,8 @@ def main(args):
             )
         # ##############################
 
-        if can_reset and update_step % args.relora == 2:
-            logger.info(f"First step after lora reset lr is {optimizer.param_groups[0]['lr']}")
+        if can_reset_optimizer and update_step % args.cycle_length == 2:
+            logger.info(f"First step after optimizer reset lr is {optimizer.param_groups[0]['lr']}")
 
         lr = optimizer.param_groups[0]["lr"]
         tokens_in_update = tokens_seen - tokens_seen_before
