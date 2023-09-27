@@ -563,8 +563,11 @@ def main(args):
         logger.info(f"Loading training state like global_step, update_step, and tokens_seen from {args.resume_from}")
         with open(os.path.join(args.resume_from, "training_state.json")) as f:
             _old_state = json.load(f)
+
         global_step = _old_state["global_step"]
-        update_step = _old_state["update_step"]
+        # We do overwrite update_step here to correctly initialize the scheduler
+        # which should start from warmed_up_model's update step or zero
+        _update_step = _old_state["update_step"]
         tokens_seen = _old_state["tokens_seen"]
         tokens_seen_before = _old_state["tokens_seen_before"]
         n_lora_restarts = _old_state["n_lora_restarts"]
@@ -572,7 +575,7 @@ def main(args):
         logger.info(f"update_step       : {update_step}")
         logger.info(f"tokens_seen       : {tokens_seen}")
         logger.info(f"tokens_seen_before: {tokens_seen_before}")
-        logger.info(f"Will train for {args.num_training_steps - update_step} update steps")
+        logger.info(f"Will train for {args.num_training_steps - _update_step} update steps")
 
         if args.megatron_dataset_config is not None:
             train_loader.batch_sampler.start_iter = global_step
@@ -626,13 +629,6 @@ def main(args):
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     lora_params = [p for n, p in model.named_parameters() if p.requires_grad and "lora_" in n]
     trainable_params_names = [name for name, p in model.named_parameters() if p.requires_grad]
-    non_trainable_params_names = [name for name, p in model.named_parameters() if not p.requires_grad]
-
-    logger.info("*" * 40)
-    logger.info("Non-trainable paramters:")
-    for name in non_trainable_params_names:
-        logger.info(f"{name:40}")
-    logger.info("*" * 40)
 
     if args.use_peft and len(lora_params) == 0:
         raise ValueError("No LoRA parameters found")
@@ -657,7 +653,7 @@ def main(args):
         logger.warning("PEFT config (all but lora_r) is hardcoded!")
         run_config["peft_config"] = {
             "r": args.lora_r,
-            "alpha": 32,
+            "alpha": args.lora_alpha,
             "dropout": 0.1,
             "target_modules": ["attn", "mlp"],
         }
@@ -687,10 +683,12 @@ def main(args):
     else:
         raise ValueError(f"Optimizer {args.optimizer} not supported")
 
+    _scheduler_steps = args.num_training_steps - update_step
+    logger.info(f"Scheduler will run for {_scheduler_steps} update steps")
     scheduler = training_utils.get_scheculer(
         optimizer=optimizer,
         scheduler_type=args.scheduler,
-        num_training_steps=args.num_training_steps,
+        num_training_steps=_scheduler_steps,
         warmup_steps=args.warmup_steps,
         min_lr_ratio=args.min_lr_ratio,
         cycle_length=args.cycle_length,
@@ -871,11 +869,11 @@ def main(args):
         # restart model after we modify the learning rate, so on the next step after the relora frequency
         can_reset_relora = args.relora is not None and (
             args.resume_from is not None
-            or local_step * args.gradient_accumulation > args.relora
+            or local_step // args.gradient_accumulation >= args.relora
         )
 
         if can_reset_relora and update_step % args.relora == 1:
-            logger.info(f"{args.resume_from=}, {local_step=}, {args.relora=}, prod: {local_step * args.gradient_accumulation}")
+            logger.info(f"{args.resume_from=}, {local_step=}, {args.relora=}, thresh: {local_step // args.gradient_accumulation}")
             logger.info(f"Performing lora reset at update step {update_step}. Current lr is {optimizer.param_groups[0]['lr']}")
             n_lora_restarts += 1
 
@@ -888,7 +886,7 @@ def main(args):
 
         can_reset_optimizer = args.relora is not None and (
             args.resume_from is not None
-            or local_step * args.gradient_accumulation > args.cycle_length
+            or local_step // args.gradient_accumulation >= args.cycle_length
         )
 
         if can_reset_optimizer and update_step % args.cycle_length == 1:
