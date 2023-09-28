@@ -76,4 +76,11 @@ def check_args_torchrun_main(args):
     if args.distributed_type == "fsdp" and "zero" in args.optimizer:
         raise ValueError("FSDP does zero-optimization by default, do not specify optimizer as zero optimizer.")
 
+    if args.skip_batches is not None:
+        args.skip_batches = map(int, args.skip_batches.split(","))
+        args.skip_batches = set(args.skip_batches)
+        logger.info(f"Skipping batches {args.skip_batches}")
+
+    args.skip_batches = args.skip_batches or set()
+
     return args
