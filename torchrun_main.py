@@ -717,15 +717,19 @@ def main(args):
 
     if args.dataset_path is not None:
         # Huggingface dataset to dataloader
+        logger.info(f"Full training set size: {len(train_dataset)}")
+        logger.info(repr(train_dataset))
         train_dataset = datasets.distributed.split_dataset_by_node(train_dataset, rank=global_rank, world_size=world_size)
         eval_dataset = datasets.distributed.split_dataset_by_node(eval_dataset, rank=global_rank, world_size=world_size)
+        logger.info(f"Train set size after shard: {len(train_dataset)}")
 
-        logger.info(f"Skipping the first {global_step} batches")
+        _skip_batches = update_step * args.gradient_accumulation
+        logger.info(f"Skipping the first {_skip_batches} batches")
         train_loader = SkipDataLoader(
             train_dataset,
             batch_size=args.batch_size,
             collate_fn=default_data_collator,
-            skip_batches=global_step,
+            skip_batches=_skip_batches,
             num_workers=args.workers,
         )
         eval_loader = torch.utils.data.DataLoader(
@@ -939,6 +943,7 @@ def main(args):
         update_time = time.time()
         if prof is not None: prof.step()
     else: # for-else statement
+        print(f"Warning: reached the end of the dataset. Training stopped, {global_rank=}, {update_step=}")
         logger.warning("Reached the end of the dataset. Training stopped")
 
     if prof is not None: prof.stop()
