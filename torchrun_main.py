@@ -129,6 +129,7 @@ def parse_args(args=None):
     parser.add_argument("--comment", type=str, default=None, help="Wandb notes")
     parser.add_argument("--wandb_watch", default=False, type=lambda x: x.lower() == "true",
                         help="Enable wandb.watch (may make training unstable, but might be good for understanding gradients)")
+    parser.add_argument("--skip_batches", default=None, type=str, help="Batch numbers to skip, separated by comma. E.g., 2003,2990,12309. Specifically, update_step numbers.")
 
     parser.add_argument("--seed", type=int, default=0)
 
@@ -499,6 +500,7 @@ def main(args):
     tokens_seen = 0
     tokens_seen_before = 0
     n_lora_restarts = 0
+    n_optimizer_resets = 0
 
     if args.warmed_up_model is not None:
         logger.info("*" * 40)
@@ -649,15 +651,6 @@ def main(args):
         "dataset_preprocessing_args": dataset_preprocessing_args,
     })
 
-    if args.use_peft:
-        logger.warning("PEFT config (all but lora_r) is hardcoded!")
-        run_config["peft_config"] = {
-            "r": args.lora_r,
-            "alpha": args.lora_alpha,
-            "dropout": 0.1,
-            "target_modules": ["attn", "mlp"],
-        }
-
     if global_rank == 0:
         wandb.config.update(run_config, allow_val_change=True)
         wandb.save(os.path.abspath(__file__), policy="now") # save current script
@@ -771,6 +764,11 @@ def main(args):
         global_step += 1
         local_step += 1
 
+        if update_step in args.skip_batches:
+            if global_step % args.gradient_accumulation == 0:
+                update_step += 1
+            continue
+
         if local_step == 1: logger.info(f"Starting first step")
         if update_step >= args.num_training_steps:
             logger.info(f"Reached max number of update steps (f{args.num_training_steps}). Stopping training.")
@@ -833,6 +831,7 @@ def main(args):
                 "tokens_seen": tokens_seen,
                 "tokens_seen_before": tokens_seen_before,
                 "n_lora_restarts": n_lora_restarts,
+                "n_optimizer_resets": n_optimizer_resets,
                 "update_time": update_time,
             }
             save_model(
@@ -873,6 +872,7 @@ def main(args):
         )
 
         if can_reset_relora and update_step % args.relora == 1:
+            _lora_reset_time = time.time()
             logger.info(f"{args.resume_from=}, {local_step=}, {args.relora=}, thresh: {local_step // args.gradient_accumulation}")
             logger.info(f"Performing lora reset at update step {update_step}. Current lr is {optimizer.param_groups[0]['lr']}")
             n_lora_restarts += 1
@@ -883,6 +883,9 @@ def main(args):
                 model.apply(merge_and_reinit_functional)
             else:
                 raise ValueError(f"Unknown distributed type {args.distributed_type}")
+            
+            _lora_reset_time = time.time() - _lora_reset_time
+            logger.info(f"LoRA reset took {_lora_reset_time:.2f}s")
 
         can_reset_optimizer = args.relora is not None and (
             args.resume_from is not None
@@ -891,9 +894,9 @@ def main(args):
 
         if can_reset_optimizer and update_step % args.cycle_length == 1:
             # scheduler should provide a new warmup after the reset
-            training_utils.check_lr_and_alert(optimizer, max_lr=1e-4)
-
             logger.info(f"Performing optimizer reset at update step {update_step}. Current lr is {optimizer.param_groups[0]['lr']}")
+            n_optimizer_resets += 1
+
             training_utils.optimizer_reset(
                 optimizer,
                 reset_params=lora_params,
@@ -922,6 +925,7 @@ def main(args):
                 "throughput_examples": args.total_batch_size / update_time,
                 "throughput_batches": batches_in_update / update_time,
                 "n_lora_restarts": n_lora_restarts,
+                "n_optimizer_resets": n_optimizer_resets,
                 },
                 step=global_step,
             )
