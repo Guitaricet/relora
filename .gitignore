@@ -1,11 +1,15 @@
+profiler_logs
+**/*.sbatch
 checkpoints
 **/wandb/**
 wandb
 ignore
 experimental_data
+fine_tuning_results*
 log
 notebooks/*.pdf
 notebooks/*.png
+preprocessed_data
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

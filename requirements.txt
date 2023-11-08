@@ -6,5 +6,11 @@ peft
 wandb
 loguru
 nvitop
-lion-pytorch
 matplotlib
+pybind11
+bitsandbytes
+scipy
+evaluate
+packaging
+ninja
+flash-attn

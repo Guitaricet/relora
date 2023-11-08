@@ -1,17 +1,35 @@
-import os
+import os, sys
+import yaml
 from datetime import datetime
 
 from loguru import logger
 
 
 def check_args_torchrun_main(args):
-    if not args.train_ln:
-        logger.error("Are you sure? Not training LN is a bad idea.")
-        raise ValueError("Are you sure? Not training LN is a bad idea.")
+    if args.training_config is not None:
+        logger.info(f"Yaml config provided for the run. The file {args.training_config} is used to provide all the parameters.")
+        if len(sys.argv) > 3:
+            logger.error(f"argv length is {len(sys.argv)}")
+            raise RuntimeError(
+                "You provided both a yaml config and command line arguments. "
+                "Please use only one of the two options."
+            )
+        with open(args.training_config) as f:
+            training_config = yaml.safe_load(f)
+        for k, v in training_config.items():
+            if k == "lr": v = float(v)
+            setattr(args, k, v)
 
-    if args.save_dir is None:
-        # use checkpoints / model name, date and time as save directory
-        args.save_dir = f"checkpoints/{args.model_config.split('/')[-1].rstrip('.json')}-{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}"
+    if (args.dataset_path is None) == (args.megatron_dataset_config is None):
+        raise ValueError("Either --dataset_path or --megatron_dataset_config must be specified and not both\n"
+                         f"Got {args.dataset_path=} and {args.megatron_dataset_config=}")
+
+    if args.megatron_dataset_config is not None:
+        if not os.path.exists(args.megatron_dataset_config):
+            raise ValueError(f"{args.megatron_dataset_config=} does not exist")
+
+    if args.batch_size is None:
+        raise ValueError("batch_size must be specified")
 
     if args.tags is not None:
         args.tags = args.tags.split(",")
@@ -32,8 +50,8 @@ def check_args_torchrun_main(args):
         args.num_training_steps = args.max_train_tokens // args.total_batch_size
         logger.info(f"Training for {args.num_training_steps} update steps")
 
-    if args.continue_from is not None:
-        assert os.path.exists(args.continue_from), f"--continue_from={args.continue_from} does not exist"
+    if args.warmed_up_model is not None:
+        assert os.path.exists(args.warmed_up_model), f"{args.warmed_up_model=} does not exist"
 
     if args.dtype in ["fp16", "float16"]:
         raise NotImplementedError("fp16 is not supported in torchrun_main.py. Use deepspeed_main.py instead (but it seems to have bugs)")
@@ -50,5 +68,19 @@ def check_args_torchrun_main(args):
 
     assert 0 <= args.optimizer_random_pruning < 1, "--optimizer_random_pruning must be between 0 and 1"
     assert 0 <= args.optimizer_magnitude_pruning < 1, "--optimizer_magnitude_pruning must be between 0 and 1"
+
+
+    if args.distributed_type == "fsdp" and args.weight_decay > 0:
+        raise ValueError("FSDP does not support weight decay yet.")
+
+    if args.distributed_type == "fsdp" and "zero" in args.optimizer:
+        raise ValueError("FSDP does zero-optimization by default, do not specify optimizer as zero optimizer.")
+
+    if args.skip_batches is not None:
+        args.skip_batches = map(int, args.skip_batches.split(","))
+        args.skip_batches = set(args.skip_batches)
+        logger.info(f"Skipping batches {args.skip_batches}")
+
+    args.skip_batches = args.skip_batches or set()
 
     return args

@@ -1,0 +1,41 @@
+# dataset
+megatron_dataset_config: configs/pile_megatron_dataset.yaml
+max_length: 2048
+workers: 8
+
+# model
+model_name_or_path: EleutherAI/pythia-1b
+model_revision: step1000
+
+# saving
+save_dir: checkpoints/relora_1b_Aug5_2023_run2
+autoresume: true
+
+# ReLoRA
+use_peft: true
+force_keep_original: true
+lora_r: 128
+relora: 1000
+restart_warmup_steps: 100
+reset_optimizer_on_relora: false
+optimizer_magnitude_pruning: 0.8
+
+# Optimization
+optimizer: adam
+batch_size: 8
+total_batch_size: 1024
+lr: 4e-4
+adam_beta1: 0.9
+adam_beta2: 0.95
+weight_decay: 0.01
+scheduler: cosine_restarts
+warmup_steps: 500  # used to be 13_000, but reduced it to comply with the scheduler
+num_training_steps: 130_000  # used to be 133_000, but it's an ugly number
+eval_every: 500
+save_every: 500
+
+# Misc
+dtype: bfloat16
+distributed_type: ddp
+tags: relora1b_debug
+comment: "Checking if ReLoRA 1B loss is similar to regular training loss overnight"

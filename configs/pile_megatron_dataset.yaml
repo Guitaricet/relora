@@ -1,0 +1,98 @@
+{
+  # NOTE: this config does not support using - in the key names,
+  # because we load it from yaml and then feed to NeoXArgs.from_dict().
+  # Use _ instead of - in the key names
+
+  "pipe_parallel_size": 1,
+  "model_parallel_size": 1,
+
+  # path to dataset .bin and .idx file (path should be filenames without `.bin` or `.idx`)
+  "train_data_paths": ["/fsx/pile/pile_20B_tokenizer_text_document"],
+  "valid_data_paths": ["/fsx/pile/pile_20B_tokenizer_text_document"],
+  "test_data_paths": ["/fsx/pile/pile_20B_tokenizer_text_document"],
+
+  "tokenizer_type": "HFTokenizer",
+  "vocab_file": "configs/pythia_tokenizer.json",
+
+  "train_micro_batch_size_per_gpu": "",
+  "train_batch_size": "",
+  "num_workers": 8,
+
+  "seq_length": 2048,
+  "train_iters": 143000,
+  "data_impl": "mmap",
+
+  ############################################################################################
+  # everything below is ignored by the training script, only needed to create neox_args object
+  ############################################################################################
+
+  # model settings
+  "num_layers": 12,
+  "hidden_size": 768,
+  "num_attention_heads": 12,
+  "max_position_embeddings": 2048,
+  "pos_emb": "rotary",
+  "rotary_pct": 0.25,
+  "no_weight_tying": true,
+  "gpt_j_residual": true,
+  "output_layer_parallelism": "column",
+
+  "scaled_upper_triang_masked_softmax_fusion": true,
+  "bias_gelu_fusion": true,
+
+  # init methods
+  "init_method": "small_init",
+  "output_layer_init_method": "wang_init",
+
+  "optimizer": {
+    "type": "Adam",
+    "params": {
+      "lr": 0.0006,
+      "betas": [0.9, 0.95],
+      "eps": 1.0e-8,
+    }
+  },
+  "min_lr": 0.00006,
+
+  "zero_optimization": {
+    "stage": 1,
+    "allgather_partitions": True,
+    "allgather_bucket_size": 500000000,
+    "overlap_comm": True,
+    "reduce_scatter": True,
+    "reduce_bucket_size": 500000000,
+    "contiguous_gradients": True,
+    "cpu_offload": False
+  },
+
+  # activation checkpointing
+  "checkpoint_activations": true,
+  "checkpoint_num_layers": 1,
+  "partition_activations": true,
+  "synchronize_each_layer": true,
+
+  # regularization
+  "gradient_clipping": 1.0,
+  "weight_decay": 0.1,
+  "hidden_dropout": 0,
+  "attention_dropout": 0,
+
+  # precision settings
+  "fp16": {
+    "fp16": true,
+    "enabled": true,
+    "loss_scale": 0,
+    "loss_scale_window": 1000,
+    "initial_scale_power": 12,
+    "hysteresis": 2,
+    "min_loss_scale": 1,
+  },
+
+  "lr_decay_iters": 143000,
+  "distributed_backend": "nccl",
+  "lr_decay_style": "cosine",
+  "warmup": 0.01,
+  # "save_interval": 250,
+  # "eval_interval": 40000,
+  # "eval_iters": 10,
+}
