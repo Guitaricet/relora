@@ -8,9 +8,11 @@ Requires Python 3.10+ (due to param annotaitons style) and PyTorch 2.0+ (for fla
 All requirements are listed in `requirements.txt` and kept up-to-date.
 
 ```bash
-cd peft_pretraining
 pip install -e .
+pip install flash-attn
 ```
+
+> We do not have flash attention in our requirements, because for some reason flash attention installation script requires torch and some other requirements to already be installed
 
 ## 1B training script
 
