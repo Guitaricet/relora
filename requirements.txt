@@ -13,4 +13,3 @@ scipy
 evaluate
 packaging
 ninja
-flash-attn
