@@ -15,7 +15,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.utils.data
-import torch.distributed as dist as dist
+import torch.distributed as dist
 from torch.distributed.optim import ZeroRedundancyOptimizer
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
