@@ -12,7 +12,7 @@ import argparse
 import multiprocessing
 
 from loguru import logger
-from datasets import load_dataset
+from datasets import load_dataset, DatasetDict
 from transformers import AutoTokenizer
 
 
@@ -54,7 +54,8 @@ def main(args):
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
     dataset = load_dataset(args.dataset, args.dataset_config)
     if args.take is not None:
-        dataset = dataset.select(range(args.take))
+        dataset_dict = {k: v.select(range(args.take)) for k, v in dataset.items()}
+        dataset = DatasetDict(dataset_dict)
 
     logger.info("Tokenizing and chunking the dataset")
     _time = time.time()
