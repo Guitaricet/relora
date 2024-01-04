@@ -35,9 +35,9 @@ Pre-process data (might take some time)
 ```bash
 python pretokenize.py \
     --save_dir preprocessed_data \
-    --tokenizer <HF tokenizer name or path> \
-    --dataset <HF dataset id> \
-    --dataset_config <DatasetConfig> \
+    --tokenizer t5-base \
+    --dataset c4 \
+    --dataset_config en \
     --text_field text \
     --sequence_length 512
 ```
