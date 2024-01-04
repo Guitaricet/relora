@@ -12,7 +12,7 @@ import argparse
 import multiprocessing
 
 from loguru import logger
-from datasets import load_dataset, DatasetDict
+from datasets import load_dataset, DatasetDict, Dataset
 from transformers import AutoTokenizer
 
 
@@ -52,9 +52,14 @@ def main(args):
         raise ValueError(f"Path {save_path} already exists")
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
-    dataset = load_dataset(args.dataset, args.dataset_config)
+    logger.info(f"Loaidng the dataset in streaming mode: {args.take is not None}")
+    dataset = load_dataset(args.dataset, args.dataset_config, streaming=args.take is not None)
+
     if args.take is not None:
-        dataset_dict = {k: v.select(range(args.take)) for k, v in dataset.items()}
+        logger.info(f"Taking {args.take} examples from the dataset")
+        def take(ds, n):
+            return Dataset.from_generator(lambda: (yield from ds.take(n)))
+        dataset_dict = {k: take(v, args.take) for k, v in dataset.items()}
         dataset = DatasetDict(dataset_dict)
 
     logger.info("Tokenizing and chunking the dataset")
