@@ -29,6 +29,7 @@ def parse_args(args=None):
     parser.add_argument("--num_cpu", type=int, default=multiprocessing.cpu_count(), help="Number of CPU cores")
     parser.add_argument("--save_dir", type=str, required=True, help="Directory to save the pre-tokenized dataset")
 
+    parser.add_argument("--take", type=int, default=None, help="Number of examples to take from the dataset")
     args = parser.parse_args(args)
 
     return args
@@ -52,6 +53,8 @@ def main(args):
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
     dataset = load_dataset(args.dataset, args.dataset_config)
+    if args.take is not None:
+        dataset = dataset.select(range(args.take))
 
     logger.info("Tokenizing and chunking the dataset")
     _time = time.time()
