@@ -85,9 +85,6 @@ def parse_args(args=None):
                         help="Use random pruning to reduce optimizer matrix internal dimensionality.")
     parser.add_argument("--optimizer_magnitude_pruning", default=0.0, type=float,
                         help="Use magnitude pruning to reduce optimizer matrix internal dimensionality.")
-    parser.add_argument("--force_keep_original", default=False, type=lambda x: x.lower() == "true",
-                        help=("Keep original model parameters even if relora is None. "
-                              "Useful for making sure that full-LoRa model is equivalent to model+LoRa."))
 
     parser.add_argument("--optimizer", default="Adam", help="Could be adam (for AdamW) or adam_zero for ZeroRedundancyOptimizer(AdamW)")
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -529,13 +526,6 @@ def main(args):
     params_before = sum(p.numel() for p in model.parameters())
 
     if args.use_peft:
-        need_linear_weight = (
-            args.relora is not None
-            or args.force_keep_original
-            or args.warmed_up_model is not None
-        )
-        logger.info(f"Wrapping model with LoRA ({need_linear_weight=})")
-
         # target modules should define all linear layers from transformer block
         # "attn" and "mlp" are used in LLaMA
         # "attention" and "mlp" are used in Pythia
@@ -545,9 +535,6 @@ def main(args):
             lora_alpha=args.lora_alpha,
             lora_dropout=0.1,
             target_modules=["attn", "attention", "mlp"],
-            trainable_scaling=args.train_scaling,
-            keep_original_weights=True,
-            lora_only=not need_linear_weight,
             quantize=args.quantize,
             use_double_quant=args.use_double_quant,
         )

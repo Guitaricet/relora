@@ -38,7 +38,6 @@ def check_args_torchrun_main(args):
         # just for more clear hparam logging to wandb
         args.relora = None
         args.lora_r = None
-        args.force_keep_original = False
 
     if args.total_batch_size is None:
         args.gradient_accumulation = args.gradient_accumulation or 1
